@@ -15,7 +15,9 @@ so each pixel is copied from where the motion says and then gets the same
 colour difference that B had at that spot.
 
 The transition, frame by frame:
-- It starts from A's last clean picture.
+- It starts from A's last clean picture. During A's window, A's own P-frames are
+  decoded on the same picture as well, with a weight that fades from 1 to 0, so A
+  keeps moving inside the mosh and its motion mixes with B's in the same pixels.
 - B's P-frames, from B's first frame up to the end of B's window, are spread over
   the whole transition: output frame i is at the fractional position s = m u^2
   among the m P-frames, with u = (i + 1) / length. Early on s moves slowly, so
@@ -53,8 +55,8 @@ CONFIDENCE = 0.7     # keep a block's vector only if it cuts the block's error t
 LOOK_AHEAD = 30      # B frame pairs searched for the P-frame to repeat (no B window)
 RESIDUAL_COST = 0.3  # how much residual counts against motion when picking that P-frame
 CHANGE_FULL = 16.0   # residual (in grey levels) at which a pixel emerges earliest
-EARLY_START = 0.2    # share of the transition after which pixels where B changes turn into B
-LATE_START = 0.7     # ... and pixels where B is still
+EARLY_START = 0.25   # share of the transition after which pixels where B changes turn into B
+LATE_START = 0.55    # ... and pixels where B is still
 
 
 @register
@@ -72,7 +74,7 @@ class MotionBloom(TransitionEffect):
 
     def render(self, ctx, progress):
         p = ctx.params
-        b = ctx.incoming
+        a, b = ctx.outgoing, ctx.incoming
         picture = _last_clean_a(ctx).astype(np.float32)
         pairs = _b_pairs(ctx)
         if pairs:
@@ -124,6 +126,16 @@ class MotionBloom(TransitionEffect):
             # of its P-frame (step of it per frame), so the colour arrives evenly
             # and adds up to the residual once.
             picture = warp.warp(picture, p["gain"] * field, "bilinear") + p["residual"] * step * error
+
+            # A keeps playing into the mosh: during A's window, A's own P-frames are
+            # decoded on the same picture too, with a weight that fades from 1 to 0,
+            # so A's movement and B's movement mix in the same pixels.
+            if i < len(ctx.a_window):
+                index = ctx.a_window[i]
+                if index > 0 and not _same(a.frame(index - 1), a.frame(index)):
+                    a_field, a_error = _p_frame(a, index - 1, index, ctx.size)
+                    a_weight = 1.0 - i / len(ctx.a_window)
+                    picture = warp.warp(picture, a_weight * a_field, "bilinear") + a_weight * a_error
             picture = np.clip(picture, 0.0, 255.0)
 
             # Emerge: B's share of each pixel follows a planned curve, so A's ghost
