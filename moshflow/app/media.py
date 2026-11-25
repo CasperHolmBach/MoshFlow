@@ -1,5 +1,21 @@
-"""Reading video properties for the UI, without it depending on OpenCV."""
+"""Reading video properties and preview frames for the UI, without depending on OpenCV."""
 
-from moshflow.videoio import VideoInfo, probe
+import numpy as np
 
-__all__ = ["VideoInfo", "probe"]
+from moshflow.videoio import OpenCVReader, VideoInfo, probe
+
+
+def read_frame(path: str, index: int = 0) -> np.ndarray | None:
+    """Reads a single BGR frame from `path`, clamping `index` to valid bounds."""
+    try:
+        with OpenCVReader(path) as reader:
+            total = reader.info.frame_count
+            if total <= 0:
+                return None
+            clamped = max(0, min(index, total - 1))
+            return reader.read(clamped)
+    except (IOError, IndexError):
+        return None
+
+
+__all__ = ["VideoInfo", "probe", "read_frame"]
