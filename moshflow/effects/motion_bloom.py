@@ -20,7 +20,7 @@ SEARCH = 8
 
 @register
 class MotionBloom(TransitionEffect):
-    info = EffectInfo("motion_bloom", "Motion Bloom (draft)", "Sample",
+    info = EffectInfo("motion_bloom", "Motion Bloom (draft)", "Viktor Tost",
                       "One motion repeats on the last picture of clip A, so moving areas swell.")
 
     @classmethod
