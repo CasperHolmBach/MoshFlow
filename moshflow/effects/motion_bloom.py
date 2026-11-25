@@ -17,12 +17,15 @@ colour difference that B had at that spot.
 The transition, frame by frame:
 - It starts from A's last clean picture.
 - B's P-frames, from B's first frame up to the end of B's window, are spread over
-  the whole transition: output frame i shows P-frame j = m u^2, with m P-frames
-  and u = (i + 1) / length. The first ones are decoded many times in a row;
-  repeating the motion makes it bloom, so moving areas keep stretching and
-  swelling. Later ones come one per frame, so B is at its normal speed when the
-  transition ends, and the picture never stops moving in between. The residual is added only on the first copy;
-  adding it again on every copy would burn the colours out.
+  the whole transition: output frame i is at the fractional position s = m u^2
+  among the m P-frames, with u = (i + 1) / length. Early on s moves slowly, so
+  each P-frame's motion is decoded for many frames in a row; repeating the motion
+  makes it bloom, so moving areas keep stretching and swelling. At the end s
+  moves one P-frame per frame, so B is at its normal speed when it lands.
+- Nothing jumps: the motion and B's frame blend smoothly from one P-frame to the
+  next, and each P-frame's residual is spread over its copies (the step of s per
+  frame), so it adds up to the residual once instead of landing in one frame.
+  Adding the full residual on every copy would burn the colours out.
 - Emerge: after every frame, each pixel also moves a step towards B's real frame
   at that point: P += h (B - P). h grows from 0 to 1 over the transition and is
   larger where B's residual is large (where B changes), so B grows out of the
@@ -69,39 +72,61 @@ class MotionBloom(TransitionEffect):
         b = ctx.incoming
         picture = _last_clean_a(ctx).astype(np.float32)
         pairs = _b_pairs(ctx)
-        if not pairs:
-            field, error = _bloom_p_frame(b, ctx.b_window.start, ctx.size)
+        if pairs:
+            cache: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 
-        current, change = -1, np.zeros(picture.shape[:2], np.float32)
+            def decoded(j: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+                """P-frame j as (F, E, change), kept for the current and the next one."""
+                j = min(j, len(pairs) - 1)
+                if j not in cache:
+                    for old in [k for k in cache if k < j - 1]:
+                        del cache[old]
+                    field, error = _p_frame(b, *pairs[j], ctx.size)
+                    change = np.minimum(np.abs(color.bgr_to_y(error)) / CHANGE_FULL, 1.0)
+                    cache[j] = (field, error, change)
+                return cache[j]
+        else:
+            still = min(ctx.b_window.start, len(b) - 1)
+            field, error = _bloom_p_frame(b, still, ctx.size)
+            change = np.minimum(np.abs(color.bgr_to_y(error)) / CHANGE_FULL, 1.0)
+            target = b.frame(still).astype(np.float32)
+
+        position = 0.0
         for i in range(ctx.length):
             if progress.cancelled:
                 return
+            u = (i + 1) / ctx.length
             if pairs:
-                # The P-frame of B that this output frame shows: j = m u^2. Early ones
-                # stay for many frames in a row (duplicated, the bloom); towards the end
-                # one P-frame per frame, so B reaches its normal speed as it lands.
-                j = min(int(len(pairs) * ((i + 1) / ctx.length) ** 2), len(pairs) - 1)
-                first_copy = j != current
-                if first_copy:
-                    current = j
-                    field, error = _p_frame(b, *pairs[j], ctx.size)
-                    change = np.minimum(np.abs(color.bgr_to_y(error)) / CHANGE_FULL, 1.0)
-                target_index = pairs[j][1]
+                # Where in B's P-frames this output frame is: s = m u^2, a fractional
+                # position. Early on s moves slowly, so each P-frame's motion is applied
+                # for many frames (duplicated, the bloom); at the end s moves one P-frame
+                # per frame, so B is at its normal speed as it lands.
+                new_position = len(pairs) * u * u
+                step, position = new_position - position, new_position
+                j = min(int(position), len(pairs) - 1)
+                f = min(position - j, 1.0)
+                field_j, error, change = decoded(j)
+                field_next = decoded(j + 1)[0]
+                # Between two P-frames the motion and B's frame blend smoothly, so
+                # nothing jumps when the next P-frame takes over.
+                field = (1.0 - f) * field_j + f * field_next
+                before, after = pairs[j]
+                target = ((1.0 - f) * b.frame(before).astype(np.float32)
+                          + f * b.frame(after).astype(np.float32))
             else:
-                first_copy = i == 0
-                target_index = min(ctx.b_window.start, len(b) - 1)
+                step = 1.0 / ctx.length
 
-            picture = warp.warp(picture, p["gain"] * field, "bilinear")
-            if first_copy:
-                picture = picture + p["residual"] * error
+            # Decode: the motion on every frame; the residual spread over the copies
+            # of its P-frame (step of it per frame), so the colour arrives evenly
+            # and adds up to the residual once.
+            picture = warp.warp(picture, p["gain"] * field, "bilinear") + p["residual"] * step * error
             picture = np.clip(picture, 0.0, 255.0)
 
             # Emerge: a step towards B's real frame, bigger later and where B changes.
-            u = (i + 1) / ctx.length
             h = np.minimum(p["emerge"] * u * u * (0.25 + 0.75 * change), 1.0)
             if i == ctx.length - 1:
                 h = np.ones_like(h)
-            picture = picture + h[..., None] * (b.frame(target_index).astype(np.float32) - picture)
+            picture = picture + h[..., None] * (target - picture)
 
             progress.report(i + 1, ctx.length)
             yield color.to_uint8(picture)
