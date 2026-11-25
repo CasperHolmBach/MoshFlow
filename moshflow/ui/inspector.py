@@ -5,7 +5,8 @@ gets its UI without any change here.
 """
 
 import os
-from typing import Callable
+from dataclasses import replace
+from typing import Callable, Sequence
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -25,7 +26,7 @@ from PySide6.QtWidgets import (
 
 from moshflow.api import BoolParam, ChoiceParam, FloatParam, IntParam, ParamSpec, validate_params
 from moshflow.app.catalog import EffectCatalog
-from moshflow.core.project import ALIGNMENTS
+from moshflow.core.project import ALIGNMENTS, Transition
 from moshflow.ui.model import CLIP, TRANSITION, ProjectModel
 
 ALIGNMENT_LABELS = {"before": "Before the cut", "center": "Centred on the cut", "after": "After the cut"}
@@ -145,20 +146,20 @@ class Inspector(QWidget):
         duration.setSingleStep(0.1)
         duration.setSuffix(" s")
         duration.setValue(transition.duration)
-        duration.valueChanged.connect(lambda v: self._set(transition, "duration", v))
+        duration.valueChanged.connect(lambda v: self._update_transition(index, duration=v))
         form.addRow("Duration", duration)
 
         alignment = QComboBox()
         for value in ALIGNMENTS:
             alignment.addItem(ALIGNMENT_LABELS[value], value)
         alignment.setCurrentIndex(ALIGNMENTS.index(transition.alignment))
-        alignment.currentIndexChanged.connect(lambda _: self._set(transition, "alignment", alignment.currentData()))
+        alignment.currentIndexChanged.connect(lambda _: self._update_transition(index, alignment=alignment.currentData()))
         form.addRow("Alignment", alignment)
 
         seed = QSpinBox()
         seed.setRange(0, MAX_SEED)
         seed.setValue(transition.seed)
-        seed.valueChanged.connect(lambda v: self._set(transition, "seed", v))
+        seed.valueChanged.connect(lambda v: self._update_transition(index, seed=v))
         form.addRow("Seed", seed)
 
         try:
@@ -171,32 +172,31 @@ class Inspector(QWidget):
             form.addRow(note)
         values = self._current_params(transition, entry.specs)
         for spec in entry.specs:
-            form.addRow(spec.label, make_param_widget(spec, values[spec.id], self._param_setter(transition, spec.id)))
+            setter = self._param_setter(index, spec, entry.specs)
+            form.addRow(spec.label, make_param_widget(spec, values[spec.id], setter))
         return page
 
     @staticmethod
-    def _current_params(transition, specs) -> dict[str, object]:
+    def _current_params(transition: Transition, specs: Sequence[ParamSpec]) -> dict[str, object]:
+        """The transition's parameter values, or the defaults if they do not fit its effect."""
         try:
             return validate_params(specs, transition.params)
         except ValueError:
-            transition.params = {}
             return validate_params(specs, {})
 
-    def _param_setter(self, transition, param_id: str) -> Callable[[object], None]:
+    def _param_setter(self, index: int, spec: ParamSpec, specs: Sequence[ParamSpec]) -> Callable[[object], None]:
         def setter(value: object) -> None:
-            transition.params[param_id] = value
-            self._model.touch()
+            transition = self._model.project.transitions[index]
+            params = {**self._current_params(transition, specs), spec.id: value}
+            self._model.set_transition(index, replace(transition, params=params), spec.label)
         return setter
 
-    def _set(self, target, attribute: str, value: object) -> None:
-        setattr(target, attribute, value)
-        self._model.touch()
+    def _update_transition(self, index: int, **changes: object) -> None:
+        transition = self._model.project.transitions[index]
+        self._model.set_transition(index, replace(transition, **changes), next(iter(changes)))
 
     def _set_effect(self, index: int, effect_id: str) -> None:
-        transition = self._model.project.transitions[index]
-        transition.effect = effect_id
-        transition.params = {}
-        self._model.touch()
+        self._update_transition(index, effect=effect_id, params={})
         self._show_page(self._transition_page(index))   # controls of the new effect
 
     # --- clip ------------------------------------------------------------
@@ -217,7 +217,7 @@ class Inspector(QWidget):
         start.setDecimals(2)
         start.setSuffix(" s")
         start.setValue(clip.start)
-        start.valueChanged.connect(lambda v: self._set(clip, "start", v))
+        start.valueChanged.connect(lambda v: self._update_clip(index, "trim start", start=v))
         form.addRow("Trim start", start)
 
         end = QDoubleSpinBox()
@@ -226,10 +226,14 @@ class Inspector(QWidget):
         end.setSuffix(" s")
         end.setSpecialValueText("End of clip")     # shown at the minimum value, 0
         end.setValue(clip.end or 0.0)
-        end.valueChanged.connect(lambda v: self._set(clip, "end", v or None))
+        end.valueChanged.connect(lambda v: self._update_clip(index, "trim end", end=v or None))
         form.addRow("Trim end", end)
 
         remove = QPushButton("Remove from timeline")
         remove.clicked.connect(lambda: self._model.remove_clip(index))
         form.addRow(remove)
         return page
+
+    def _update_clip(self, index: int, what: str, **changes: object) -> None:
+        clip = self._model.project.clips[index]
+        self._model.set_clip(index, replace(clip, **changes), what)

@@ -1,10 +1,10 @@
 """ExportBar: output settings, the Export button, progress and Cancel.
 
-The render runs in a QThread on a copy of the project, so the UI stays
-responsive and can keep editing.
+The render runs in a QThread, so the UI stays responsive and can keep editing.
+Projects are immutable, so the render keeps using the version from when Export
+was pressed.
 """
 
-import copy
 import os
 
 from PySide6.QtCore import QThread, Signal
@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from moshflow.app.render_job import JobProgress, RenderResult, render_project
-from moshflow.core.project import Project
+from moshflow.core.project import OutputSettings, Project
 from moshflow.core.renderer import RenderCancelled
 from moshflow.ui.model import ProjectModel
 
@@ -38,7 +38,7 @@ class RenderWorker(QThread):
 
     def __init__(self, project: Project, output: str, parent=None):
         super().__init__(parent)
-        self._project = copy.deepcopy(project)
+        self._project = project
         self._output = output
         self._job = JobProgress(self.progressed.emit)
 
@@ -105,28 +105,38 @@ class ExportBar(QWidget):
         self.width_spin.valueChanged.connect(self._store_settings)
         self.height_spin.valueChanged.connect(self._store_settings)
         self.fps_spin.valueChanged.connect(self._store_settings)
-        model.projectReplaced.connect(self._load_settings)
+        self._storing = False
+        model.changed.connect(self._load_settings)      # also after Undo / Redo and Open
         self._load_settings()
 
     # --- settings --------------------------------------------------------
     def _load_settings(self) -> None:
+        if self._storing:
+            return      # the change came from these widgets; leave the text and cursor alone
         out = self._model.project.output
-        for widget in (self.width_spin, self.height_spin, self.fps_spin):
+        for widget in (self.path_edit, self.width_spin, self.height_spin, self.fps_spin):
             widget.blockSignals(True)
         self.path_edit.setText(out.path)
         self.width_spin.setValue(out.width or 0)
         self.height_spin.setValue(out.height or 0)
         self.fps_spin.setValue(out.fps or 0.0)
-        for widget in (self.width_spin, self.height_spin, self.fps_spin):
+        for widget in (self.path_edit, self.width_spin, self.height_spin, self.fps_spin):
             widget.blockSignals(False)
 
+    def _settings_from_widgets(self) -> OutputSettings:
+        return OutputSettings(
+            path=self.path_edit.text().strip() or "output.mp4",
+            width=self.width_spin.value() or None,
+            height=self.height_spin.value() or None,
+            fps=self.fps_spin.value() or None,
+        )
+
     def _store_settings(self, *_) -> None:
-        out = self._model.project.output
-        out.path = self.path_edit.text().strip() or "output.mp4"
-        out.width = self.width_spin.value() or None
-        out.height = self.height_spin.value() or None
-        out.fps = self.fps_spin.value() or None
-        self._model.touch()
+        self._storing = True
+        try:
+            self._model.set_output(self._settings_from_widgets())
+        finally:
+            self._storing = False
 
     def _browse(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Export video", self.resolved_output(), "MP4 video (*.mp4)")

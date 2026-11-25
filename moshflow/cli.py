@@ -76,14 +76,13 @@ def _try_project(args) -> Project:
     for item in args.param:
         key, _, raw = item.partition("=")
         params[key] = _parse_value(raw)
-    project = Project(output=OutputSettings(path=args.output, width=width, height=height, fps=args.fps))
     # Keep only a short piece of each clip so the test render is fast.
     a_info = probe(args.clip_a)
     keep = args.context + args.duration
-    project.add_clip(Clip(args.clip_a, start=max(0.0, a_info.duration - keep)))
-    project.add_clip(Clip(args.clip_b, end=keep))
-    project.transitions[0] = Transition(args.effect, args.duration, args.align, params, args.seed)
-    return project
+    return (Project(output=OutputSettings(path=args.output, width=width, height=height, fps=args.fps))
+            .with_clip(Clip(args.clip_a, start=max(0.0, a_info.duration - keep)))
+            .with_clip(Clip(args.clip_b, end=keep))
+            .with_transition(0, Transition(args.effect, args.duration, args.align, params, args.seed)))
 
 
 def _parse_value(raw: str) -> object:

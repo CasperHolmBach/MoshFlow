@@ -28,11 +28,10 @@ def clips(tmp_path):
 
 
 def two_clip_project(clips, output, effect="crossfade", **kwargs):
-    project = Project(output=OutputSettings(path=str(output), **kwargs))
-    project.add_clip(Clip(clips[0]))
-    project.add_clip(Clip(clips[1]))
-    project.transitions[0] = Transition(effect, 1.0, "center")
-    return project
+    return (Project(output=OutputSettings(path=str(output), **kwargs))
+            .with_clip(Clip(clips[0]))
+            .with_clip(Clip(clips[1]))
+            .with_transition(0, Transition(effect, 1.0, "center")))
 
 
 def test_probe_reads_video_properties(clips):
@@ -66,8 +65,8 @@ def test_clips_are_conformed_to_the_output_format(tmp_path):
 
 def test_trim_shortens_a_clip(clips, tmp_path):
     project = two_clip_project(clips, tmp_path / "out.mp4", effect="hard_cut")
-    project.clips[0].start = 1.0
-    project.clips[1].end = 2.0
+    project = (project.with_clip_replaced(0, Clip(clips[0], start=1.0))
+               .with_clip_replaced(1, Clip(clips[1], end=2.0)))
     assert render_project(project).frames == 20 + 20
 
 
