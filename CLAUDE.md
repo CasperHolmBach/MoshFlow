@@ -38,6 +38,25 @@ Work in the files of the person you are helping. Do not change `moshflow/api/`
 (API v1 is frozen) or another member's files; if that seems necessary, say so and
 let the user ask Yuhyeon. A new shared helper goes in a new file in `moshflow/toolkit/`.
 
+## Git
+
+The repository is `github.com/Fnhid/MoshFlow` (private). `main` must always pass
+`python -m pytest`, so everyone can start from it at any time.
+
+- Never commit to `main` directly. Each person works on their own branch:
+  `effect/keyframe-drop` (Nicolai), `effect/motion-bloom` (Viktor),
+  `effect/liquid-melt` (Casper), and `core/<topic>` or `ui/<topic>` (Yuhyeon).
+- On an effect branch, change only that effect's file. Anything else needs Yuhyeon first.
+- Before opening a pull request, bring in the latest `main`
+  (`git fetch origin` then `git merge origin/main`) and run `python -m pytest`.
+- Open a pull request into `main`; Yuhyeon reviews and merges it.
+- Never commit `.venv/`, rendered videos, Word or PowerPoint files.
+
+Why this keeps work apart: effects import only `moshflow.api` and
+`moshflow.toolkit`, and the core and UI never import an effect directly. So
+changes to the core or UI cannot break an effect unless the API changes, and an
+API change gets its own pull request that the whole team sees first.
+
 ## How an effect works
 
 One file in `moshflow/effects/`, one `TransitionEffect` subclass with `@register`.
@@ -70,14 +89,16 @@ python3.12 -m venv .venv
 .venv/bin/python -m pytest tests/test_toolkit.py            # shared helpers
 .venv/bin/python -m moshflow.cli try --effect keyframe_drop a.mp4 b.mp4 -o test.mp4 --size 640x360
 .venv/bin/python run.py                                     # the GUI
-.venv/bin/python tools/update_vs_project.py                 # after adding or removing a .py file
+.venv/bin/python tools/update_vs_project.py                 # Yuhyeon only, after merging new .py files
 ```
 
 ## Definition of done
 
 1. `python -m pytest` passes, including `test_compliance.py` and `test_effect_contract.py`.
 2. `moshflow.cli try` renders a short video with the effect, and it looks right.
-3. New files are listed in Visual Studio: run `tools/update_vs_project.py`.
+3. The `.sln` and `.pyproj` are untouched. If you added a `.py` file, say so in the
+   pull request; Yuhyeon regenerates the Visual Studio files after merging, so two
+   branches never conflict in `MoshFlow.pyproj`.
 4. No new dependencies, no edits outside your area, no debug files left behind.
 
 ## Visual Studio and submission

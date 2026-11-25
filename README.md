@@ -34,6 +34,21 @@ On Windows, use `.venv\Scripts\` instead of `.venv/bin/`.
    and parameters in the Inspector.
 4. Press **Export**. The video is written in the background.
 
+## Work together
+
+Each member works on their own branch and opens a pull request into `main`;
+`main` always passes the tests.
+
+| Branch | Who | Changes only |
+| --- | --- | --- |
+| `effect/keyframe-drop` | Nicolai Hansen | `moshflow/effects/keyframe_drop.py` |
+| `effect/motion-bloom` | Viktor Tost | `moshflow/effects/motion_bloom.py` |
+| `effect/liquid-melt` | Casper Bach | `moshflow/effects/liquid_melt.py` |
+| `core/<topic>`, `ui/<topic>` | Yuhyeon Cha | Everything else |
+
+Effects depend only on `moshflow.api` and `moshflow.toolkit`, so work on the core and
+the UI does not affect them. See [`CLAUDE.md`](CLAUDE.md), "Git", for the full rules.
+
 ## Write an effect
 
 The full contract is in [`docs/API.md`](docs/API.md). Team members using Claude Code
