@@ -19,21 +19,27 @@ The transition, frame by frame:
   decoded on the same picture as well, with a weight that fades from 1 to 0, so A
   keeps moving inside the mosh and its motion mixes with B's in the same pixels.
 - B's P-frames, from B's first frame up to the end of B's window, are spread over
-  the whole transition: output frame i is at the fractional position s = m u^2
-  among the m P-frames, with u = (i + 1) / length. Early on s moves slowly, so
-  each P-frame's motion is decoded for many frames in a row; repeating the motion
-  makes it bloom, so moving areas keep stretching and swelling. At the end s
-  moves one P-frame per frame, so B is at its normal speed when it lands.
+  the whole transition: output frame i is at a fractional position s among the
+  P-frames (see _b_position). Early on s moves at 0.15 P-frames per frame, so
+  each P-frame's motion is decoded for several frames in a row; repeating the
+  motion makes it bloom, so moving areas keep stretching and swelling. Then B
+  speeds up, and in the last part s moves one P-frame per frame, so the B that
+  becomes visible plays at its real speed and never shows a frame twice.
 - Nothing jumps: the motion and B's frame blend smoothly from one P-frame to the
   next, and each P-frame's residual is spread over its copies (the step of s per
   frame), so it adds up to the residual once instead of landing in one frame.
   Adding the full residual on every copy would burn the colours out.
 - Emerge: after every frame, each pixel also moves a step towards B's nearest
   real frame at that point: P += h (B - P). The steps follow a planned share of B
-  per pixel: it starts rising at 20 % of the transition where B changes most and
-  at 70 % where B is still, eases in and out, and reaches 1 on the last frame.
+  per pixel: it starts rising at 25 % of the transition where B changes most and
+  at 55 % where B is still, eases in and out, and reaches 1 on the last frame.
   So B grows out of the same motion that smears A, starting where B moves, and
   A's ghost lasts until the end instead of B finishing early and crawling.
+  A pixel is dragged only by the share of A still left in it, so finished pixels
+  are not cracked by B's rough vectors.
+- Exit: what is shown is the decoded picture mixed with B's real, sharp frame by
+  share^2. The decoded picture is resampled every frame and slowly blurs; at the
+  end the viewer sees B's actual footage, so the exit is sharp.
 - With no B window (alignment "before"), B has no P-frames before its first
   frame, so B's cleanest early P-frame is repeated instead.
 
@@ -57,6 +63,8 @@ RESIDUAL_COST = 0.3  # how much residual counts against motion when picking that
 CHANGE_FULL = 16.0   # residual (in grey levels) at which a pixel emerges earliest
 EARLY_START = 0.25   # share of the transition after which pixels where B changes turn into B
 LATE_START = 0.55    # ... and pixels where B is still
+SPEED_RAMP = 0.3     # share of the transition over which B speeds up to its real speed
+SLOW_SPEED = 0.15    # B's speed (P-frames per output frame) during the bloom at the start
 
 
 @register
@@ -104,11 +112,11 @@ class MotionBloom(TransitionEffect):
                 return
             u = (i + 1) / ctx.length
             if pairs:
-                # Where in B's P-frames this output frame is: s = m u^2, a fractional
-                # position. Early on s moves slowly, so each P-frame's motion is applied
-                # for many frames (duplicated, the bloom); at the end s moves one P-frame
-                # per frame, so B is at its normal speed as it lands.
-                new_position = len(pairs) * u * u
+                # Where in B's P-frames this output frame is (fractional, see
+                # _b_position): first B's first P-frame is repeated (the bloom), then
+                # B speeds up, and in the last part it plays at its real speed, so the
+                # B that becomes visible never shows a frame twice.
+                new_position = _b_position(u, len(pairs), ctx.length)
                 step, position = new_position - position, new_position
                 j = min(int(position), len(pairs) - 1)
                 f = min(position - j, 1.0)
@@ -125,7 +133,12 @@ class MotionBloom(TransitionEffect):
             # Decode: the motion on every frame; the residual spread over the copies
             # of its P-frame (step of it per frame), so the colour arrives evenly
             # and adds up to the residual once.
-            picture = warp.warp(picture, p["gain"] * field, "bilinear") + p["residual"] * step * error
+            # A pixel that has already turned into B is dragged less, by the share of
+            # A still left in it: B's real frames bring B's motion there already, and
+            # dragging B's picture by B's rough vectors again cracks it into cells.
+            left = (1.0 - shown)[..., None]
+            picture = (warp.warp(picture, p["gain"] * left * field, "bilinear")
+                       + p["residual"] * step * error)
 
             # A keeps playing into the mosh: during A's window, A's own P-frames are
             # decoded on the same picture too, with a weight that fades from 1 to 0,
@@ -150,8 +163,38 @@ class MotionBloom(TransitionEffect):
             picture = picture + h[..., None] * (target - picture)
             shown = share
 
+            # What is shown: the decoded picture, mixed with B's real, sharp frame by
+            # share^2. The decoded picture is resampled every frame and slowly blurs;
+            # near the end this shows B's actual footage, so the exit is sharp and
+            # moves at B's own speed.
+            sharp = (share * share)[..., None]
+            out = picture + sharp * (target - picture)
             progress.report(i + 1, ctx.length)
-            yield color.to_uint8(picture)
+            yield color.to_uint8(out)
+
+
+def _b_position(u: float, count: int, length: int) -> float:
+    """Position among B's `count` P-frames at progress u (0..1); count at u = 1.
+
+    B's speed (P-frames per output frame) is SLOW_SPEED until u_a, rises linearly
+    to 1 at u_b = u_a + SPEED_RAMP, and stays 1 after that. Below 1, each P-frame
+    is decoded for several output frames in a row (duplicated): the bloom. At 1,
+    B plays at its real speed, so the end shows no frame twice. u_b is chosen so
+    that about `count` P-frames are used:
+    SLOW_SPEED + (1 - SLOW_SPEED) ((1 - u_b) + SPEED_RAMP / 2) = count / length.
+    """
+    ramp, slow = SPEED_RAMP, SLOW_SPEED
+    fast_part = (count / length - slow) / (1.0 - slow)
+    u_b = min(max(1.0 + ramp / 2.0 - fast_part, ramp), 1.0)
+    u_a = u_b - ramp
+
+    def frames_used(x: float) -> float:
+        extra = 0.0
+        if x > u_a:
+            extra = (min(x, u_b) - u_a) ** 2 / (2.0 * ramp) + max(x - u_b, 0.0)
+        return slow * x + (1.0 - slow) * extra
+
+    return count * frames_used(u) / frames_used(1.0)
 
 
 def _b_share(u: float, changed: np.ndarray, emerge: float) -> np.ndarray:
