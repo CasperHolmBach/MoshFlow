@@ -18,17 +18,20 @@ colour difference that B had at that spot.
 The transition, frame by frame:
 - A's part of the window (before the cut): the picture starts as A's last clean
   frame. A's own P-frames are decoded on it, so A keeps moving at its real speed
-  up to the cut. On top, B's opening P-frame (its first real
-  motion) is decoded again on every frame: the duplicated P-frame that makes the
-  picture bloom along B's motion. Only B's motion is used here; nothing of B's
-  picture is shown yet, because B has not started.
+  up to the cut. On top, B's opening motions (the people moving in B's first
+  second, without the camera's own movement, see _opening_motions) are decoded
+  again and again: each one is repeated for 4 frames (the duplicated P-frame that
+  makes the picture bloom), then the next takes over, like moshy's ppulse.
+  Only B's motion is used here; nothing of B's picture is shown yet, because B
+  has not started.
 - B's part of the window (after the cut): B's own P-frames, one per frame, at B's
   real speed: frame k of the window decodes the P-frame from B's frame k - 1 to k.
   A repeated (duplicate) frame has no P-frame, so the previous motion carries on.
-  B's residuals ramp up over the first 8 frames, so B's details do not burst in.
+  B's residuals grow from 0 at the cut to full at the end, so B's details are
+  painted in gradually instead of taking over within a few frames.
 - Emerge: during B's part, each pixel also moves a step towards B's real frame:
   P += h (B - P). The steps follow a planned share of B per pixel: it starts
-  rising at the cut where B changes most and 40 % into B's part where B is still,
+  rising at the cut where B changes most and 25 % into B's part where B is still,
   eases in and out, and reaches 1 on the last frame. A pixel is dragged only by
   the share of A still left in it, so finished pixels are not cracked by B's
   rough vectors.
@@ -55,11 +58,12 @@ from moshflow.toolkit import color, motion, warp
 BLOCK = 16           # block size and search range of the motion, at full size
 SEARCH = 8
 CONFIDENCE = 0.7     # keep a block's vector only if it cuts the block's error to below 70 %
-LOOK_AHEAD = 30      # B frames searched for its opening motion
+LOOK_AHEAD = 30      # B frames searched for its opening motions
+OPENING_COUNT = 6    # how many of B's strongest opening motions the bloom cycles through
+OPENING_HOLD = 4     # frames each of them is repeated before the next takes over
 CHANGE_FULL = 16.0   # residual (in grey levels) at which a pixel emerges earliest
 EARLY_START = 0.0    # share of B's part after which pixels where B changes turn into B
-LATE_START = 0.4     # ... and pixels where B is still
-RESIDUAL_RAMP = 8    # frames after the cut over which B's residuals reach full strength
+LATE_START = 0.25    # ... and pixels where B is still
 NO_B_PART = 1 / 3    # with no B window, the share of the end in which B emerges
 
 
@@ -82,11 +86,11 @@ class MotionBloom(TransitionEffect):
         width, height = ctx.size
         picture = _last_clean_a(ctx).astype(np.float32)
         first_b = min(ctx.b_window.start, len(b) - 1)
-        opening = _opening_motion(b, first_b, ctx.size)
+        openings = _opening_motions(b, first_b, ctx.size)
 
         a_frames = len(ctx.a_window)
         emerge_from = a_frames if len(ctx.b_window) else round(ctx.length * (1 - NO_B_PART))
-        field = opening
+        field = openings[0]
         change = np.zeros((height, width), np.float32)
         changed = np.zeros((height, width), np.float32)   # most B has changed at a pixel so far
         shown = np.zeros((height, width), np.float32)     # B's planned share at the last frame
@@ -95,8 +99,11 @@ class MotionBloom(TransitionEffect):
                 return
             error = None
             if i < a_frames:
-                # Before the cut: B's opening P-frame again (duplicated), motion only.
-                field, index = opening, first_b
+                # Before the cut: one of B's opening motions again (duplicated), motion
+                # only; every OPENING_HOLD frames the next one takes over, like moshy's
+                # ppulse, so the bloom keeps moving instead of settling.
+                field = openings[(i // OPENING_HOLD) % len(openings)]
+                index = first_b
             else:
                 # After the cut: B's own next P-frame, at B's real speed.
                 index = ctx.b_window[i - a_frames]
@@ -111,9 +118,9 @@ class MotionBloom(TransitionEffect):
             left = (1.0 - shown)[..., None]
             picture = warp.warp(picture, p["gain"] * left * field, "bilinear")
             if error is not None:
-                # B's residuals come in over the first frames after the cut, so B's
-                # details do not burst onto A's picture all at once.
-                ramp = min((i + 1 - a_frames) / RESIDUAL_RAMP, 1.0)
+                # B's residuals grow over B's part (0 at the cut, full at the end), so
+                # B's details are painted in gradually instead of all at once.
+                ramp = (i + 1 - a_frames) / max(ctx.length - a_frames, 1)
                 picture = picture + p["residual"] * ramp * error
 
             # A keeps playing into the mosh: during A's window, A's own P-frames are
@@ -194,17 +201,28 @@ def _p_frame(clip, first: int, second: int, size: tuple[int, int]) -> tuple[np.n
     return field, clip.frame(second).astype(np.float32) - predicted
 
 
-def _opening_motion(clip, start: int, size: tuple[int, int]) -> np.ndarray:
-    """B's first real motion: the field of its first non-repeated frame pair.
+def _opening_motions(clip, start: int, size: tuple[int, int]) -> list[np.ndarray]:
+    """The motions to repeat before the cut: people's own movement in B's first second.
 
-    Film converted to 30 fps repeats frames, and a repeated frame has no motion,
-    so the first pair can be empty; up to LOOK_AHEAD frames are searched.
+    For each non-repeated frame pair in B's first LOOK_AHEAD frames, the field's
+    average vector (the camera moving everything the same way) is subtracted, so
+    what remains is how things move relative to each other. Repeating a camera pan
+    would only slide A's picture off the screen; repeating local motion melts it.
+    The OPENING_COUNT pairs with the most local motion are kept, in time order.
     """
-    width, height = size
+    found = []
     for first in range(start, min(start + LOOK_AHEAD, len(clip) - 1)):
-        if not _same(clip.frame(first), clip.frame(first + 1)):
-            return _field(clip, first, first + 1, size)
-    return np.zeros((height, width, 2), np.float32)
+        if _same(clip.frame(first), clip.frame(first + 1)):
+            continue
+        field = _field(clip, first, first + 1, size)
+        local = field - field.mean(axis=(0, 1))
+        amount = float(((local[..., 0] ** 2 + local[..., 1] ** 2) ** 0.5).mean())
+        found.append((amount, first, local))
+    if not found:
+        width, height = size
+        return [np.zeros((height, width, 2), np.float32)]
+    strongest = sorted(found, key=lambda item: -item[0])[:OPENING_COUNT]
+    return [local for _, _, local in sorted(strongest, key=lambda item: item[1])]
 
 
 def _same(a: np.ndarray, b: np.ndarray) -> bool:
