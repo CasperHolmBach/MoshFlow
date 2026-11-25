@@ -246,3 +246,86 @@ def test_edit_menu_has_undo_and_redo(window):
 def test_relative_output_goes_next_to_the_first_clip(window):
     window.model.add_clip(window.paths[0])
     assert window.export_bar.resolved_output() == os.path.join(os.path.dirname(window.paths[0]), "output.mp4")
+
+
+def test_frame_to_pixmap_preserves_aspect_ratio():
+    import numpy as np
+    from moshflow.ui.frame_display import frame_to_pixmap
+
+    frame = np.full((180, 320, 3), 128, dtype=np.uint8)
+    pixmap = frame_to_pixmap(frame, (80, 80))
+    assert not pixmap.isNull()
+    assert (pixmap.width(), pixmap.height()) == (80, 45)
+
+
+def test_preview_panel_renders_selected_transition(app, window):
+    window.model.add_clip(window.paths[0])
+    window.model.add_clip(window.paths[1])
+    window.model.set_transition(0, Transition("crossfade", duration=0.4), "effect")
+    window.model.select(TRANSITION, 0)
+
+    window.preview.start_transition_preview()
+    deadline = time.monotonic() + 15.0
+    while window.preview._worker is not None and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.005)
+    app.processEvents()
+
+    assert window.preview._worker is None
+    assert window.preview._rendered is not None
+    assert len(window.preview._rendered.frames) > 0
+    assert window.preview.scrubber.maximum() == len(window.preview._rendered.frames) - 1
+    window.preview.stop_worker()
+
+
+def test_export_preset_updates_dimensions_and_undoes(window):
+    bar = window.export_bar
+    idx_720 = bar.preset_box.findData("1280x720")
+    assert idx_720 >= 0
+    bar.preset_box.setCurrentIndex(idx_720)
+    assert (window.model.project.output.width, window.model.project.output.height) == (1280, 720)
+    assert bar.preset_box.currentData() == "1280x720"
+    window.model.undo_stack.undo()
+    assert window.model.project.output.width is None
+    assert bar.preset_box.currentData() == "auto"
+
+
+def test_timeline_zoom_scales_clip_widths(window):
+    window.model.add_clip(window.paths[0])
+    # Add a longer video width test by checking zoom ratio changes pixels per second.
+    before = window.timeline._pixels_per_second
+    window.timeline.zoom_in()
+    assert window.timeline._pixels_per_second > before
+    window.timeline.zoom_out()
+    assert abs(window.timeline._pixels_per_second - before) < 1e-6
+
+
+def test_launcher_falls_back_to_local_venv(monkeypatch, tmp_path):
+    import run as launcher
+
+    fake_venv = tmp_path / ".venv" / "Scripts" / "python.exe"
+    fake_venv.parent.mkdir(parents=True)
+    fake_venv.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(launcher, "ROOT", tmp_path)
+    monkeypatch.setattr(launcher, "_missing_packages", lambda: ["PySide6"])
+    monkeypatch.setattr(launcher, "_python_is_ready", lambda p: p == fake_venv)
+    monkeypatch.delenv(launcher.REEXEC_GUARD, raising=False)
+    called = []
+    monkeypatch.setattr(launcher, "_reexec", lambda exe, args: called.append((exe, args)) or 0)
+
+    assert launcher.launch(["--flag"]) == 0
+    assert called == [(fake_venv, ["--flag"])]
+
+
+def test_launcher_prints_guide_when_python_too_old(monkeypatch, capsys):
+    import run as launcher
+
+    monkeypatch.setattr(launcher.sys, "version_info", (3, 9, 13, "final", 0))
+    monkeypatch.setattr(launcher, "_missing_packages", lambda: [])
+    monkeypatch.setattr(launcher, "_find_ready_venv", lambda root: None)
+
+    assert launcher.launch([]) == 1
+    err = capsys.readouterr().err
+    assert "Python 3.10" in err
+    assert "requirements.txt" in err

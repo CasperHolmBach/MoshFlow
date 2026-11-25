@@ -34,6 +34,7 @@
     <Compile Include="moshflow\app\__init__.py" />
     <Compile Include="moshflow\app\catalog.py" />
     <Compile Include="moshflow\app\media.py" />
+    <Compile Include="moshflow\app\preview.py" />
     <Compile Include="moshflow\app\render_job.py" />
     <Compile Include="moshflow\app\store.py" />
     <Compile Include="moshflow\cli.py" />
@@ -59,10 +60,13 @@
     <Compile Include="moshflow\toolkit\warp.py" />
     <Compile Include="moshflow\ui\__init__.py" />
     <Compile Include="moshflow\ui\export_bar.py" />
+    <Compile Include="moshflow\ui\frame_display.py" />
     <Compile Include="moshflow\ui\inspector.py" />
     <Compile Include="moshflow\ui\main_window.py" />
     <Compile Include="moshflow\ui\media_bin.py" />
     <Compile Include="moshflow\ui\model.py" />
+    <Compile Include="moshflow\ui\preview_panel.py" />
+    <Compile Include="moshflow\ui\theme.py" />
     <Compile Include="moshflow\ui\timeline_view.py" />
     <Compile Include="moshflow\videoio\__init__.py" />
     <Compile Include="moshflow\videoio\opencv_reader.py" />

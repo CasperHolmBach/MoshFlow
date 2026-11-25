@@ -1,4 +1,4 @@
-"""TimelineView: clips from left to right with a transition chip on every cut.
+"""TimelineView: clips from left to right with a timecode ruler and transition chips.
 
 Click selects a clip or a chip, dragging a clip reorders it, Delete removes it,
 and clips can be dropped in from the media bin or the file manager.
@@ -7,27 +7,43 @@ and clips can be dropped in from the media bin or the file manager.
 import os
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QFontMetrics, QPainter, QPen
+from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import QApplication, QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView
 
 from moshflow.app.catalog import EffectCatalog
+from moshflow.app.media import read_frame
+from moshflow.ui.frame_display import frame_to_pixmap
 from moshflow.ui.media_bin import CLIP_MIME, local_paths
 from moshflow.ui.model import CLIP, TRANSITION, ProjectModel
+from moshflow.ui.theme import (
+    CHIP_BORDER,
+    CHIP_FILL,
+    CLIP_BORDER,
+    CLIP_FILL,
+    CLIP_STRIPE,
+    HARD_CUT_BORDER,
+    HARD_CUT_FILL,
+    RULER_BG,
+    RULER_LINE,
+    RULER_TEXT,
+    SELECTED_RING,
+    TEXT_PRIMARY,
+    TEXT_SECONDARY,
+    TIMELINE_BG,
+)
 
-PIXELS_PER_SECOND = 28
-MIN_CLIP_WIDTH = 110
-MAX_CLIP_WIDTH = 420
-CHIP_WIDTH = 104
-CHIP_GAP = 4
-CLIP_HEIGHT = 56
-CHIP_HEIGHT = 38
-
-CLIP_COLOR = QColor("#3D3850")
-CHIP_COLOR = QColor("#C2286A")
-HARD_CUT_COLOR = QColor("#5A5468")
-SELECTED_COLOR = QColor("#2DE2E6")
-TEXT_COLOR = QColor("#FFFFFF")
-HINT_COLOR = QColor("#8F8AA0")
+DEFAULT_PIXELS_PER_SECOND = 36.0
+MIN_PIXELS_PER_SECOND = 16.0
+MAX_PIXELS_PER_SECOND = 96.0
+MIN_CLIP_WIDTH = 152
+MAX_CLIP_WIDTH = 440
+CHIP_WIDTH = 114
+CHIP_GAP = 8
+RULER_HEIGHT = 24
+CLIP_TOP = RULER_HEIGHT + 14
+CLIP_HEIGHT = 68
+CHIP_HEIGHT = 46
+THUMB_SIZE = (54, 34)
 
 
 class TimelineView(QGraphicsView):
@@ -42,10 +58,12 @@ class TimelineView(QGraphicsView):
         self.setAcceptDrops(True)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setRenderHint(QPainter.Antialiasing)
-        self.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.setFixedHeight(112)
-        self.setBackgroundBrush(QBrush(QColor("#1C1924")))
+        self.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.setFixedHeight(134)
+        self.setBackgroundBrush(QBrush(TIMELINE_BG))
 
+        self._pixels_per_second = DEFAULT_PIXELS_PER_SECOND
+        self._thumbs: dict[str, QPixmap] = {}
         self.regions: list[tuple[QRectF, str, int]] = []
         self._clip_rects: list[QRectF] = []
         self._press_pos: QPointF | None = None
@@ -56,47 +74,162 @@ class TimelineView(QGraphicsView):
         model.selectionChanged.connect(self.rebuild)
         self.rebuild()
 
+    # --- zoom ------------------------------------------------------------
+    def zoom_in(self) -> None:
+        self._pixels_per_second = min(MAX_PIXELS_PER_SECOND, self._pixels_per_second * 1.25)
+        self.rebuild()
+
+    def zoom_out(self) -> None:
+        self._pixels_per_second = max(MIN_PIXELS_PER_SECOND, self._pixels_per_second / 1.25)
+        self.rebuild()
+
+    def reset_zoom(self) -> None:
+        self._pixels_per_second = DEFAULT_PIXELS_PER_SECOND
+        self.rebuild()
+
     # --- drawing ---------------------------------------------------------
+    def _thumbnail(self, path: str) -> QPixmap | None:
+        if path in self._thumbs:
+            return self._thumbs[path]
+        frame = read_frame(path, 0)
+        if frame is None:
+            return None
+        pixmap = frame_to_pixmap(frame, THUMB_SIZE)
+        self._thumbs[path] = pixmap
+        return pixmap
+
     def rebuild(self) -> None:
         self._scene.clear()
         self._marker = None
         self.regions, self._clip_rects = [], []
         project = self._model.project
         if not project.clips:
-            hint = QGraphicsSimpleTextItem("Drag clips here from the media bin")
-            hint.setBrush(QBrush(HINT_COLOR))
-            self._scene.addItem(hint)
-            self._scene.setSceneRect(self._scene.itemsBoundingRect())
+            self._draw_empty_state()
             return
 
-        x = 0.0
+        x = 12.0
+        elapsed = 0.0
+        ruler_marks: list[tuple[float, float]] = [(x, 0.0)]
         for i, clip in enumerate(project.clips):
             seconds = self._model.clip_duration(i)
-            width = min(MAX_CLIP_WIDTH, max(MIN_CLIP_WIDTH, seconds * PIXELS_PER_SECOND))
-            rect = QRectF(x, -CLIP_HEIGHT / 2, width, CLIP_HEIGHT)
+            width = min(MAX_CLIP_WIDTH, max(MIN_CLIP_WIDTH, seconds * self._pixels_per_second))
+            rect = QRectF(x, CLIP_TOP, width, CLIP_HEIGHT)
             self._clip_rects.append(rect)
-            self._add_block(rect, CLIP_COLOR, (CLIP, i), f"{os.path.basename(clip.path)}\n{seconds:.1f} s")
+            self._add_clip_card(rect, i, clip.path, seconds)
+            elapsed += seconds
             x += width + CHIP_GAP
+            ruler_marks.append((x - CHIP_GAP / 2, elapsed))
+
             if i < len(project.transitions):
                 transition = project.transitions[i]
-                chip = QRectF(x, -CHIP_HEIGHT / 2, CHIP_WIDTH, CHIP_HEIGHT)
-                color = HARD_CUT_COLOR if transition.effect == "hard_cut" else CHIP_COLOR
-                self._add_block(chip, color, (TRANSITION, i),
-                                f"{self._effect_name(transition.effect)}\n{transition.duration:g} s")
+                chip_top = CLIP_TOP + (CLIP_HEIGHT - CHIP_HEIGHT) / 2
+                chip = QRectF(x, chip_top, CHIP_WIDTH, CHIP_HEIGHT)
+                self._add_transition_chip(chip, i, transition.effect, transition.duration)
                 x += CHIP_WIDTH + CHIP_GAP
-        self._scene.setSceneRect(self._scene.itemsBoundingRect().adjusted(-10, -8, 10, 8))
 
-    def _add_block(self, rect: QRectF, color: QColor, target: tuple[str, int], label: str) -> None:
-        selected = self._model.selection == target
-        pen = QPen(SELECTED_COLOR, 2.5) if selected else QPen(Qt.NoPen)
-        block = self._scene.addRect(rect, pen, QBrush(color))
-        metrics = QFontMetrics(self.font())
-        lines = [metrics.elidedText(line, Qt.ElideMiddle, int(rect.width()) - 14) for line in label.split("\n")]
-        text = QGraphicsSimpleTextItem("\n".join(lines), block)
-        text.setBrush(QBrush(TEXT_COLOR))
-        box = text.boundingRect()
-        text.setPos(rect.left() + 8, rect.center().y() - box.height() / 2)
-        self.regions.append((rect, *target))
+        total_width = max(x + 24.0, float(self.viewport().width() - 4))
+        self._draw_ruler(total_width, ruler_marks)
+        self._scene.setSceneRect(0.0, 0.0, total_width, CLIP_TOP + CLIP_HEIGHT + 16.0)
+
+    def _draw_empty_state(self) -> None:
+        width = max(520.0, float(self.viewport().width() - 28))
+        box = QRectF(12.0, 18.0, width, 86.0)
+        path = QPainterPath()
+        path.addRoundedRect(box, 8, 8)
+        pen = QPen(RULER_LINE, 1.5, Qt.DashLine)
+        self._scene.addPath(path, pen, QBrush(RULER_BG))
+        hint = QGraphicsSimpleTextItem("Drop video clips here from the Media Bin or your file manager")
+        hint.setBrush(QBrush(RULER_TEXT))
+        bounds = hint.boundingRect()
+        hint.setPos(box.center().x() - bounds.width() / 2, box.center().y() - bounds.height() / 2)
+        self._scene.addItem(hint)
+        self._scene.setSceneRect(0.0, 0.0, width + 24.0, 120.0)
+
+    def _draw_ruler(self, total_width: float, marks: list[tuple[float, float]]) -> None:
+        self._scene.addRect(QRectF(0, 0, total_width, RULER_HEIGHT), QPen(Qt.NoPen), QBrush(RULER_BG))
+        self._scene.addLine(0, RULER_HEIGHT, total_width, RULER_HEIGHT, QPen(RULER_LINE, 1))
+        font = QFont(self.font())
+        font.setPointSize(max(8, font.pointSize() - 1))
+        for x_pos, sec in marks:
+            self._scene.addLine(x_pos, RULER_HEIGHT - 7, x_pos, RULER_HEIGHT, QPen(RULER_TEXT, 1))
+            mins = int(sec // 60)
+            rem = sec - mins * 60
+            label = QGraphicsSimpleTextItem(f"{mins}:{rem:04.1f}")
+            label.setFont(font)
+            label.setBrush(QBrush(RULER_TEXT))
+            label.setPos(x_pos + 4, 4)
+            self._scene.addItem(label)
+
+    def _add_clip_card(self, rect: QRectF, index: int, clip_path: str, seconds: float) -> None:
+        selected = self._model.selection == (CLIP, index)
+        card_path = QPainterPath()
+        card_path.addRoundedRect(rect, 7, 7)
+        pen = QPen(SELECTED_RING, 2.2) if selected else QPen(CLIP_BORDER, 1.2)
+        card = self._scene.addPath(card_path, pen, QBrush(CLIP_FILL))
+
+        # Top accent stripe
+        stripe_rect = QRectF(rect.left() + 1, rect.top() + 1, rect.width() - 2, 4)
+        stripe_path = QPainterPath()
+        stripe_path.addRoundedRect(stripe_rect, 2, 2)
+        self._scene.addPath(stripe_path, QPen(Qt.NoPen), QBrush(SELECTED_RING if selected else CLIP_STRIPE))
+
+        text_left = rect.left() + 10
+        thumb = self._thumbnail(clip_path)
+        if thumb is not None and rect.width() >= MIN_CLIP_WIDTH:
+            pix_item = self._scene.addPixmap(thumb)
+            pix_item.setParentItem(card)
+            pix_y = rect.top() + 8 + (rect.height() - 12 - thumb.height()) / 2
+            pix_item.setPos(rect.left() + 8, pix_y)
+            text_left = rect.left() + 8 + thumb.width() + 8
+
+        avail = max(36, int(rect.right() - text_left - 8))
+        bold_font = QFont(self.font())
+        bold_font.setWeight(QFont.DemiBold)
+        name_text = QFontMetrics(bold_font).elidedText(os.path.basename(clip_path), Qt.ElideMiddle, avail)
+        name_item = QGraphicsSimpleTextItem(name_text, card)
+        name_item.setFont(bold_font)
+        name_item.setBrush(QBrush(QColor(TEXT_PRIMARY)))
+        name_item.setPos(text_left, rect.top() + 15)
+
+        sub_font = QFont(self.font())
+        sub_font.setPointSize(max(8, sub_font.pointSize() - 1))
+        sub_text = QFontMetrics(sub_font).elidedText(f"{seconds:.1f} s", Qt.ElideRight, avail)
+        sub_item = QGraphicsSimpleTextItem(sub_text, card)
+        sub_item.setFont(sub_font)
+        sub_item.setBrush(QBrush(QColor(TEXT_SECONDARY)))
+        sub_item.setPos(text_left, rect.top() + 36)
+
+        self.regions.append((rect, CLIP, index))
+
+    def _add_transition_chip(self, rect: QRectF, index: int, effect_id: str, duration: float) -> None:
+        selected = self._model.selection == (TRANSITION, index)
+        is_cut = effect_id == "hard_cut"
+        fill = HARD_CUT_FILL if is_cut else CHIP_FILL
+        border = SELECTED_RING if selected else (HARD_CUT_BORDER if is_cut else CHIP_BORDER)
+
+        chip_path = QPainterPath()
+        chip_path.addRoundedRect(rect, 9, 9)
+        chip = self._scene.addPath(chip_path, QPen(border, 2.2 if selected else 1.2), QBrush(fill))
+
+        avail = max(24, int(rect.width() - 16))
+        title_font = QFont(self.font())
+        title_font.setWeight(QFont.DemiBold)
+        title_text = QFontMetrics(title_font).elidedText(self._effect_name(effect_id), Qt.ElideRight, avail)
+        title_item = QGraphicsSimpleTextItem(title_text, chip)
+        title_item.setFont(title_font)
+        title_item.setBrush(QBrush(QColor("#FFFFFF")))
+        title_box = title_item.boundingRect()
+        title_item.setPos(rect.center().x() - title_box.width() / 2, rect.top() + 7)
+
+        sub_font = QFont(self.font())
+        sub_font.setPointSize(max(8, sub_font.pointSize() - 1))
+        sub_item = QGraphicsSimpleTextItem(f"{duration:g} s", chip)
+        sub_item.setFont(sub_font)
+        sub_item.setBrush(QBrush(QColor("#FFE1EE" if not is_cut else TEXT_SECONDARY)))
+        sub_box = sub_item.boundingRect()
+        sub_item.setPos(rect.center().x() - sub_box.width() / 2, rect.top() + 25)
+
+        self.regions.append((rect, TRANSITION, index))
 
     def _effect_name(self, effect_id: str) -> str:
         try:
@@ -116,15 +249,22 @@ class TimelineView(QGraphicsView):
 
     def _marker_x(self, index: int) -> float:
         if not self._clip_rects:
-            return 0.0
+            return 12.0
         if index >= len(self._clip_rects):
-            return self._clip_rects[-1].right() + CHIP_GAP
+            return self._clip_rects[-1].right() + CHIP_GAP / 2
         return self._clip_rects[index].left() - CHIP_GAP / 2
 
     def _show_marker(self, index: int) -> None:
         self._hide_marker()
         x = self._marker_x(index)
-        self._marker = self._scene.addLine(x, -CLIP_HEIGHT / 2 - 4, x, CLIP_HEIGHT / 2 + 4, QPen(SELECTED_COLOR, 3))
+        path = QPainterPath()
+        path.moveTo(x - 6, RULER_HEIGHT)
+        path.lineTo(x + 6, RULER_HEIGHT)
+        path.lineTo(x, RULER_HEIGHT + 8)
+        path.closeSubpath()
+        path.moveTo(x, RULER_HEIGHT + 8)
+        path.lineTo(x, CLIP_TOP + CLIP_HEIGHT + 6)
+        self._marker = self._scene.addPath(path, QPen(SELECTED_RING, 2.5), QBrush(SELECTED_RING))
 
     def _hide_marker(self) -> None:
         if self._marker is not None:
