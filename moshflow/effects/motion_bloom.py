@@ -1,27 +1,36 @@
-"""Motion Bloom: clip B's motion drags clip A's picture until B bleeds through.
+"""Motion Bloom: clip B's P-frames are played on clip A's last picture.
 
-Emulates a datamosh where clip B's P-frames are applied to clip A's last picture
-(Survey & Plan, 13.2). Motion is a field F, one vector per pixel, measured by
-block matching on B: F(x) says where B's content at x came from.
+Emulates the classic datamosh, as moshy's pdupe does on real video files:
+clip B's I-frame is dropped, so B's P-frames are decoded on top of A's last
+picture, and one P-frame is repeated many times to make the bloom.
 
-- Bloom (A's part of the window): B's first P-frame is repeated. Every frame,
-  each pixel of A's picture is moved once more along the same vectors, so moving
-  areas stretch and swell while still areas stay frozen.
-- Drag (B's part of the window): B's real motion, frame by frame, keeps moving
-  what is left of A's picture.
-- Bleed: every pixel switches from A to B on its own, earlier where B moves more.
-  How much of B a pixel shows is dragged along with the motion too, so B spreads
-  out of the moving areas. By the last frame every pixel shows B.
+A P-frame here is what a codec stores: a motion field F (one vector per pixel,
+measured by block matching: F(x) says where the content at x came from) and a
+residual E, the colour correction for what the motion could not predict:
+E(x) = B_next(x) - B_prev(x + F(x)). Decoding it onto a picture P gives
 
-A's picture is never warped twice: each pixel keeps a displacement D (where in A's
-picture it reads from), each new P-frame composes onto it,
-D_new(x) = F(x) + D(x + F(x)), and the pixel is read once with bilinear sampling.
-This avoids the blur of warping again and again and the zig-zag of rounding.
+    P_new(x) = P(x + F(x)) + E(x)
 
-Block matching is noisy in flat or blurry areas, and a wrong vector repeated many
-times becomes a random streak, so vectors that do not explain the motion clearly
-better than (0, 0) are dropped, and block vectors are interpolated between block
-centres so no hard block edges appear.
+so each pixel is copied from where the motion says and then gets the same
+colour difference that B had at that spot.
+
+- Bloom (A's part of the window): B's strongest P-frame among its first frames
+  is decoded again and again. Moving areas of A's picture keep stretching, and
+  the residual keeps adding B's colour changes, so they swell and burn in.
+- Drag (B's part of the window): B's real P-frames, one per frame. Where B
+  moves or changes, its residuals paint B into the picture; where B is still,
+  nothing corrects the picture and A's ghost survives.
+- Intra refresh: over the last part of the transition (`refresh`), blocks are
+  replaced one by one, in a random order from ctx.seed, by B's real block, the
+  way encoders refresh a few intra blocks per frame. A refreshed block is then
+  carried on by B's P-frames, so B takes over block by block; on the last frame
+  every block has been refreshed and the video lands on B.
+
+Block matching is noisy in flat or blurry areas, and a wrong vector repeated
+many times becomes a random streak, so vectors that do not explain the motion
+clearly better than (0, 0) are dropped, and block vectors are interpolated
+between block centres so no hard block edges appear. Pixels are read with
+bilinear sampling, so fractional vectors do not leave a zig-zag.
 """
 
 import numpy as np
@@ -32,68 +41,78 @@ from moshflow.toolkit import color, motion, warp
 BLOCK = 16          # block size and search range of the motion, at full size
 SEARCH = 8
 CONFIDENCE = 0.7    # keep a block's vector only if it cuts the block's error to below 70 %
-FAR_PART = 0.15     # a pixel dragged this share of the frame size counts as fully dragged
-SWITCH = 0.2        # share of the transition that one pixel takes to turn from A into B
-LOOK_AHEAD = 8      # B frame pairs searched for the strongest motion to repeat
+LOOK_AHEAD = 8      # B frame pairs searched for the strongest P-frame to repeat
 
 
 @register
 class MotionBloom(TransitionEffect):
     info = EffectInfo("motion_bloom", "Motion Bloom (draft)", "Viktor Tost",
-                      "Clip B's motion drags and swells clip A's last picture until B bleeds through.")
+                      "Clip B's P-frames play on clip A's last picture; one repeats until it blooms.")
 
     @classmethod
     def param_specs(cls):
         return [
             FloatParam("gain", "Gain", 1.0, 0.0, 4.0),
             FloatParam("decay", "Decay", 0.0, 0.0, 0.5),
-            FloatParam("bleed", "Bleed", 0.6, 0.0, 1.0),
+            FloatParam("residual", "Residual", 1.0, 0.0, 2.0),
+            FloatParam("refresh", "Refresh", 0.4, 0.0, 1.0),
         ]
 
     def render(self, ctx, progress):
         p = ctx.params
-        width, height = ctx.size
-        a_picture = _last_clean_a(ctx).astype(np.float32)
         b = ctx.incoming
+        picture = _last_clean_a(ctx).astype(np.float32)
         first_b = min(ctx.b_window.start, len(b) - 1)
-        motion_now = _strongest_motion(b, first_b, ctx.size)
-        far = FAR_PART * max(width, height)
+        field, error = _strongest_p_frame(b, first_b, ctx.size)
 
-        displacement = np.zeros((height, width, 2), np.float32)   # where each pixel reads A
-        shown_b = np.zeros((height, width), np.float32)           # 0..1, how much B a pixel shows
         a_frames = len(ctx.a_window)
+
+        def b_frame_at(i: int) -> np.ndarray:
+            index = first_b if i < a_frames else ctx.b_window[i - a_frames]
+            return b.frame(index).astype(np.float32)
+
+        # Each 16 x 16 block gets a random moment in the last `refresh` share of the
+        # transition at which it is refreshed; on the last frame every block is.
+        width, height = ctx.size
+        rows, cols = -(-height // BLOCK), -(-width // BLOCK)
+        rng = np.random.default_rng(ctx.seed)
+        refresh_at = 1.0 - p["refresh"] * rng.random((rows, cols))
         for i in range(ctx.length):
             if progress.cancelled:
                 return
             if i < a_frames:
-                # Bloom: the same P-frame of B again, a little weaker every frame with decay.
-                field = p["gain"] * (1.0 - p["decay"]) ** i * motion_now
-                b_frame = b.frame(first_b)
+                # Bloom: the same P-frame again, a little weaker every frame with decay.
+                strength = (1.0 - p["decay"]) ** i
             else:
-                # Drag: B's real motion. A repeated (duplicate) frame has no motion of its
-                # own, so the previous motion carries on instead of stopping for a frame.
+                # Drag: B's own next P-frame. A repeated (duplicate) frame carries no
+                # P-frame of its own, so the previous motion carries on without residual.
+                strength = 1.0
                 index = ctx.b_window[i - a_frames]
-                if index > 0 and not _same(b.frame(index - 1), b.frame(index)):
-                    motion_now = _field(b, index - 1, index, ctx.size)
-                field = p["gain"] * motion_now
-                b_frame = b.frame(index)
+                if index == 0:
+                    pass
+                elif _same(b.frame(index - 1), b.frame(index)):
+                    error = np.zeros_like(error)
+                else:
+                    field, error = _p_frame(b, index - 1, index, ctx.size)
 
-            displacement = field + warp.warp(displacement, field, "bilinear")
+            picture = (warp.warp(picture, strength * p["gain"] * field, "bilinear")
+                       + strength * p["residual"] * error)
+            picture = np.clip(picture, 0.0, 255.0)
 
-            # A pixel starts turning into B at time `start`, earlier the further it has
-            # been dragged, so B seeps in through the most smeared areas first.
-            dragged = np.minimum((displacement[..., 0] ** 2 + displacement[..., 1] ** 2) ** 0.5 / far, 1.0)
+            # Intra refresh: from here on, a block whose turn has come is replaced by B's
+            # real block. Later P-frames keep it correct, so B takes over block by block.
             t = (i + 1) / ctx.length
-            start = (1.0 - SWITCH) * (1.0 - p["bleed"] * dragged)
-            target = np.clip((t - start) / SWITCH, 0.0, 1.0)
-            shown_b = np.maximum(warp.warp(shown_b, field, "bilinear"), target)
-            if i == ctx.length - 1:
-                shown_b[:] = 1.0
-
-            w = shown_b[..., None]
-            out = (1.0 - w) * warp.warp(a_picture, displacement, "bilinear") + w * b_frame
+            fresh = _pixels(refresh_at <= t, ctx.size)
+            if fresh.any():
+                picture[fresh] = b_frame_at(i)[fresh]
             progress.report(i + 1, ctx.length)
-            yield color.to_uint8(out)
+            yield color.to_uint8(picture)
+
+
+def _pixels(blocks: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """Expands a (rows, cols) block mask to an (H, W) pixel mask."""
+    width, height = size
+    return blocks[(np.arange(height) // BLOCK)[:, None], (np.arange(width) // BLOCK)[None, :]]
 
 
 def _last_clean_a(ctx) -> np.ndarray:
@@ -101,21 +120,34 @@ def _last_clean_a(ctx) -> np.ndarray:
     return ctx.outgoing.frame(max(ctx.a_window.start - 1, 0))
 
 
-def _strongest_motion(clip, start: int, size: tuple[int, int]) -> np.ndarray:
+def _p_frame(clip, first: int, second: int, size: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
+    """The P-frame that turns frame `first` of a clip into frame `second`: (F, E).
+
+    E(x) = second(x) - first(x + F(x)), the colour the motion alone cannot explain.
+    """
+    field = _field(clip, first, second, size)
+    predicted = warp.warp(clip.frame(first), field, "bilinear")
+    return field, clip.frame(second).astype(np.float32) - predicted
+
+
+def _strongest_p_frame(clip, start: int, size: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
     """The P-frame to repeat: of B's first LOOK_AHEAD frame pairs, the one that moves most.
 
     Film converted to 30 fps repeats frames, and a repeated frame has no motion,
     so simply taking the first pair can give nothing to repeat.
     """
     width, height = size
-    best, best_amount = np.zeros((height, width, 2), np.float32), 0.0
+    best = (np.zeros((height, width, 2), np.float32), np.zeros((height, width, 3), np.float32))
+    best_amount = 0.0
     for first in range(start, min(start + LOOK_AHEAD, len(clip) - 1)):
         if _same(clip.frame(first), clip.frame(first + 1)):
             continue
         field = _field(clip, first, first + 1, size)
         amount = float((field[..., 0] ** 2 + field[..., 1] ** 2).mean())
         if amount > best_amount:
-            best, best_amount = field, amount
+            predicted = warp.warp(clip.frame(first), field, "bilinear")
+            best = (field, clip.frame(first + 1).astype(np.float32) - predicted)
+            best_amount = amount
     return best
 
 
