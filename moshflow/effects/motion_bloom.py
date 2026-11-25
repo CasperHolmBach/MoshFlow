@@ -14,17 +14,19 @@ E(x) = B_next(x) - B_prev(x + F(x)). Decoding it onto a picture P gives
 so each pixel is copied from where the motion says and then gets the same
 colour difference that B had at that spot.
 
-- Bloom (A's part of the window): B's strongest P-frame among its first frames
-  is decoded again and again. Moving areas of A's picture keep stretching, and
-  the residual keeps adding B's colour changes, so they swell and burn in.
-- Drag (B's part of the window): B's real P-frames, one per frame. Where B
-  moves or changes, its residuals paint B into the picture; where B is still,
-  nothing corrects the picture and A's ghost survives.
-- Intra refresh: over the last part of the transition (`refresh`), blocks are
-  replaced one by one, in a random order from ctx.seed, by B's real block, the
-  way encoders refresh a few intra blocks per frame. A refreshed block is then
-  carried on by B's P-frames, so B takes over block by block; on the last frame
-  every block has been refreshed and the video lands on B.
+- Bloom (A's part of the window): one P-frame of B is decoded again and again,
+  so moving areas of A's picture keep stretching and swelling. Like a pdupe
+  user picking a good frame, it is the P-frame in B's first second with the most
+  motion and the least residual, and only a little of its residual is repeated:
+  repeating a full residual dozens of times burns the colours out.
+- Drag (B's part of the window): B's real P-frames, one per frame, keep moving
+  the picture with B's motion and paint B's changes into it. A's ghost survives
+  where B is still.
+- Emerge: on top of each of B's P-frames, every pixel also moves a step towards
+  B's real frame: P += h (B - P). h grows over the drag and is larger where B's
+  residual is large (where B changes), so B appears out of the mosh while it is
+  already moving, starting where it moves, instead of starting clean. On the
+  last frame h = 1, so the transition lands exactly on B.
 
 Block matching is noisy in flat or blurry areas, and a wrong vector repeated
 many times becomes a random streak, so vectors that do not explain the motion
@@ -38,10 +40,14 @@ import numpy as np
 from moshflow.api import EffectInfo, FloatParam, TransitionEffect, register
 from moshflow.toolkit import color, motion, warp
 
-BLOCK = 16          # block size and search range of the motion, at full size
+BLOCK = 16           # block size and search range of the motion, at full size
 SEARCH = 8
-CONFIDENCE = 0.7    # keep a block's vector only if it cuts the block's error to below 70 %
-LOOK_AHEAD = 8      # B frame pairs searched for the strongest P-frame to repeat
+CONFIDENCE = 0.7     # keep a block's vector only if it cuts the block's error to below 70 %
+LOOK_AHEAD = 30      # B frame pairs searched for the P-frame to repeat
+RESIDUAL_COST = 0.3  # how much residual counts against motion when picking that P-frame
+BLOOM_RESIDUAL = 0.1 # share of the residual kept while one P-frame is repeated
+CHANGE_FULL = 16.0   # residual (in grey levels) at which a pixel emerges fastest
+EMERGE_PART = 1 / 3  # with no B window, the share of the end in which B emerges
 
 
 @register
@@ -55,7 +61,7 @@ class MotionBloom(TransitionEffect):
             FloatParam("gain", "Gain", 1.0, 0.0, 4.0),
             FloatParam("decay", "Decay", 0.0, 0.0, 0.5),
             FloatParam("residual", "Residual", 1.0, 0.0, 2.0),
-            FloatParam("refresh", "Refresh", 0.4, 0.0, 1.0),
+            FloatParam("emerge", "Emerge", 1.0, 0.0, 3.0),
         ]
 
     def render(self, ctx, progress):
@@ -63,26 +69,19 @@ class MotionBloom(TransitionEffect):
         b = ctx.incoming
         picture = _last_clean_a(ctx).astype(np.float32)
         first_b = min(ctx.b_window.start, len(b) - 1)
-        field, error = _strongest_p_frame(b, first_b, ctx.size)
+        field, error = _bloom_p_frame(b, first_b, ctx.size)
+        error = BLOOM_RESIDUAL * error
 
         a_frames = len(ctx.a_window)
-
-        def b_frame_at(i: int) -> np.ndarray:
-            index = first_b if i < a_frames else ctx.b_window[i - a_frames]
-            return b.frame(index).astype(np.float32)
-
-        # Each 16 x 16 block gets a random moment in the last `refresh` share of the
-        # transition at which it is refreshed; on the last frame every block is.
-        width, height = ctx.size
-        rows, cols = -(-height // BLOCK), -(-width // BLOCK)
-        rng = np.random.default_rng(ctx.seed)
-        refresh_at = 1.0 - p["refresh"] * rng.random((rows, cols))
+        # B emerges during B's window, or at the end if the transition has none.
+        emerge_from = a_frames if len(ctx.b_window) else round(ctx.length * (1 - EMERGE_PART))
         for i in range(ctx.length):
             if progress.cancelled:
                 return
             if i < a_frames:
                 # Bloom: the same P-frame again, a little weaker every frame with decay.
                 strength = (1.0 - p["decay"]) ** i
+                index = first_b
             else:
                 # Drag: B's own next P-frame. A repeated (duplicate) frame carries no
                 # P-frame of its own, so the previous motion carries on without residual.
@@ -99,20 +98,17 @@ class MotionBloom(TransitionEffect):
                        + strength * p["residual"] * error)
             picture = np.clip(picture, 0.0, 255.0)
 
-            # Intra refresh: from here on, a block whose turn has come is replaced by B's
-            # real block. Later P-frames keep it correct, so B takes over block by block.
-            t = (i + 1) / ctx.length
-            fresh = _pixels(refresh_at <= t, ctx.size)
-            if fresh.any():
-                picture[fresh] = b_frame_at(i)[fresh]
+            if i >= emerge_from:
+                target = b.frame(index).astype(np.float32)
+                u = (i + 1 - emerge_from) / (ctx.length - emerge_from)
+                change = np.minimum(np.abs(color.bgr_to_y(error)) / CHANGE_FULL, 1.0)
+                h = np.minimum(p["emerge"] * u * u * (0.25 + 0.75 * change), 1.0)
+                if i == ctx.length - 1:
+                    h = np.ones_like(h)
+                picture = picture + h[..., None] * (target - picture)
+
             progress.report(i + 1, ctx.length)
             yield color.to_uint8(picture)
-
-
-def _pixels(blocks: np.ndarray, size: tuple[int, int]) -> np.ndarray:
-    """Expands a (rows, cols) block mask to an (H, W) pixel mask."""
-    width, height = size
-    return blocks[(np.arange(height) // BLOCK)[:, None], (np.arange(width) // BLOCK)[None, :]]
 
 
 def _last_clean_a(ctx) -> np.ndarray:
@@ -130,24 +126,24 @@ def _p_frame(clip, first: int, second: int, size: tuple[int, int]) -> tuple[np.n
     return field, clip.frame(second).astype(np.float32) - predicted
 
 
-def _strongest_p_frame(clip, start: int, size: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
-    """The P-frame to repeat: of B's first LOOK_AHEAD frame pairs, the one that moves most.
+def _bloom_p_frame(clip, start: int, size: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
+    """The P-frame to repeat: in B's first LOOK_AHEAD frame pairs, the best motion.
 
-    Film converted to 30 fps repeats frames, and a repeated frame has no motion,
-    so simply taking the first pair can give nothing to repeat.
+    Score = mean vector length - RESIDUAL_COST * mean |residual|: lots of clean
+    motion, little that the motion cannot explain. Repeated (duplicate) frames
+    have no motion and are skipped; film converted to 30 fps has many.
     """
     width, height = size
     best = (np.zeros((height, width, 2), np.float32), np.zeros((height, width, 3), np.float32))
-    best_amount = 0.0
+    best_score = 0.0
     for first in range(start, min(start + LOOK_AHEAD, len(clip) - 1)):
         if _same(clip.frame(first), clip.frame(first + 1)):
             continue
-        field = _field(clip, first, first + 1, size)
-        amount = float((field[..., 0] ** 2 + field[..., 1] ** 2).mean())
-        if amount > best_amount:
-            predicted = warp.warp(clip.frame(first), field, "bilinear")
-            best = (field, clip.frame(first + 1).astype(np.float32) - predicted)
-            best_amount = amount
+        field, error = _p_frame(clip, first, first + 1, size)
+        score = (float(((field[..., 0] ** 2 + field[..., 1] ** 2) ** 0.5).mean())
+                 - RESIDUAL_COST * float(np.abs(error).mean()))
+        if score > best_score:
+            best, best_score = (field, error), score
     return best
 
 
