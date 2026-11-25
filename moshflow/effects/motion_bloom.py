@@ -5,12 +5,14 @@ between two neighbouring frames is measured once, as a field F. Starting from
 the last clean picture R of clip A, every output frame moves the picture along
 F again: R(k+1)(x, y) = R(k)(x + s dx, y + s dy). A pixel inside a moving area
 keeps being copied from the same direction, so the area stretches and swells,
-while pixels where F is (0, 0) stay frozen.
+while pixels where F is (0, 0) stay frozen. Each frame the moving area also
+spreads downstream (see _spread), so the bloom keeps growing instead of stopping
+at the edge of the moving blocks.
 """
 
 import numpy as np
 
-from moshflow.api import ChoiceParam, EffectInfo, FloatParam, TransitionEffect, register
+from moshflow.api import ChoiceParam, EffectInfo, FloatParam, IntParam, TransitionEffect, register
 from moshflow.toolkit import color, frames, motion, warp
 
 BLOCK = 16    # block size and search range for capturing the motion
@@ -29,6 +31,7 @@ class MotionBloom(TransitionEffect):
             ChoiceParam("source", "Motion from", "B", ("A", "B")),
             FloatParam("gain", "Gain", 1.0, 0.0, 4.0),
             FloatParam("decay", "Decay", 0.02, 0.0, 0.5),
+            IntParam("spread", "Spread (px per frame)", 4, 0, 16),
             ChoiceParam("release", "Release", "fade", ("cut", "fade")),
         ]
 
@@ -43,6 +46,8 @@ class MotionBloom(TransitionEffect):
             # The same motion again, a little weaker every frame.
             strength = p["gain"] * (1.0 - p["decay"]) ** i
             picture = warp.warp(picture, strength * field)
+            # The moving area grows in the direction it moves, so the bloom keeps pouring out.
+            field = _spread(field, p["spread"])
 
             out = picture
             if fade_length:
@@ -54,6 +59,36 @@ class MotionBloom(TransitionEffect):
 
             progress.report(i + 1, ctx.length)
             yield color.to_uint8(out)
+
+
+DIRECTIONS = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))
+
+
+def _spread(field: np.ndarray, step: int) -> np.ndarray:
+    """Lets the motion flow `step` pixels further downstream.
+
+    A pixel's vector v points to where its content comes from, so the content
+    flows the other way, along -v. For each of 8 directions u, pixel x looks at
+    the vector c of its neighbour x + step * u. If c points along u (the neighbour
+    pulls from further away, so its content flows towards x) and c is longer than
+    x's own vector, x takes c. Pixels upstream or beside a moving area keep theirs.
+    """
+    if step <= 0:
+        return field
+    height, width = field.shape[:2]
+    out = field.copy()
+    out_len2 = out[..., 0] ** 2 + out[..., 1] ** 2
+    for ux, uy in DIRECTIONS:
+        norm = (ux * ux + uy * uy) ** 0.5
+        ys = np.clip(np.arange(height) + round(step * uy / norm), 0, height - 1)
+        xs = np.clip(np.arange(width) + round(step * ux / norm), 0, width - 1)
+        c = field[ys[:, None], xs[None, :]]
+        c_len2 = c[..., 0] ** 2 + c[..., 1] ** 2
+        along = (c[..., 0] * ux + c[..., 1] * uy) / norm   # length of c along u
+        take = (along > 0.7 * c_len2 ** 0.5) & (c_len2 > out_len2)
+        out[take] = c[take]
+        out_len2[take] = c_len2[take]
+    return out
 
 
 def _clip_b_frame(ctx, clip, index: int) -> np.ndarray:
