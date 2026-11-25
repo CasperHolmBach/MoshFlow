@@ -1,10 +1,14 @@
 """Parameters, toolkit and timeline."""
 
+import json
+from dataclasses import FrozenInstanceError
+
 import numpy as np
 import pytest
 
 from helpers import ArraySource, moving_clip
 from moshflow.api import BoolParam, ChoiceParam, FloatParam, IntParam, validate_params
+from moshflow.app.store import project_from_dict, project_to_dict
 from moshflow.core.discovery import discover_effects
 from moshflow.core.project import Clip, Project, Transition
 from moshflow.core.timeline import ClipNode, TimelineError, TransitionNode, resolve
@@ -56,9 +60,9 @@ def graph_for(duration, alignment, lengths=(20, 20)):
     sources = [ArraySource(moving_clip(n)) for n in lengths]
     project = Project()
     for i in range(len(lengths)):
-        project.add_clip(Clip(f"clip{i}.mp4"))
-    for t in project.transitions:
-        t.duration, t.alignment = duration, alignment
+        project = project.with_clip(Clip(f"clip{i}.mp4"))
+    for i in range(len(project.transitions)):
+        project = project.with_transition(i, Transition(duration=duration, alignment=alignment))
     return resolve(project, sources)
 
 
@@ -97,21 +101,40 @@ def test_project_needs_one_transition_per_cut():
 def test_project_add_remove_and_move():
     project = Project()
     for name in "abc":
-        project.add_clip(Clip(name))
+        project = project.with_clip(Clip(name))
     assert len(project.transitions) == 2
-    project.move_clip(2, 0)
-    assert [c.path for c in project.clips] == ["c", "a", "b"]
-    project.remove_clip(1)
-    assert [c.path for c in project.clips] == ["c", "b"] and len(project.transitions) == 1
-    project.validate()
+    moved = project.with_clip_moved(2, 0)
+    assert [c.path for c in moved.clips] == ["c", "a", "b"]
+    removed = moved.without_clip(1)
+    assert [c.path for c in removed.clips] == ["c", "b"] and len(removed.transitions) == 1
+    removed.validate()
+    assert [c.path for c in project.clips] == ["a", "b", "c"]      # the original is untouched
+
+
+def test_project_add_at_an_index():
+    project = Project().with_clip(Clip("a")).with_clip(Clip("b")).with_clip(Clip("c"), index=0)
+    assert [c.path for c in project.clips] == ["c", "a", "b"] and len(project.transitions) == 2
+
+
+def test_project_data_cannot_be_changed_in_place():
+    transition = Transition("crossfade", params={"ease": 2.0})
+    with pytest.raises(FrozenInstanceError):
+        transition.duration = 3.0
+    with pytest.raises(TypeError):
+        transition.params["ease"] = 1.0
+    assert transition.with_param("ease", 1.0).params == {"ease": 1.0} and transition.params == {"ease": 2.0}
 
 
 def test_project_dict_round_trip():
-    project = Project()
-    project.add_clip(Clip("a.mp4", start=1.0))
-    project.add_clip(Clip("b.mp4", end=3.0))
-    project.transitions[0] = Transition("crossfade", 2.0, "after", {"ease": 2.0}, 5)
-    assert Project.from_dict(project.to_dict()) == project
+    project = (Project().with_clip(Clip("a.mp4", start=1.0)).with_clip(Clip("b.mp4", end=3.0))
+               .with_transition(0, Transition("crossfade", 2.0, "after", {"ease": 2.0}, 5)))
+    data = json.loads(json.dumps(project_to_dict(project)))
+    assert project_from_dict(data) == project
+
+
+def test_newer_project_file_is_refused():
+    with pytest.raises(ValueError, match="version"):
+        project_from_dict({"version": 99})
 
 
 def test_broken_effect_file_is_reported_and_does_not_stop_the_others(tmp_path, monkeypatch):

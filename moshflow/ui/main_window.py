@@ -1,4 +1,4 @@
-"""MainWindow: puts the views together and handles the File menu."""
+"""MainWindow: puts the views together and handles the File and Edit menus."""
 
 import sys
 
@@ -61,6 +61,12 @@ class MainWindow(QMainWindow):
             action.setShortcut(shortcut)
             action.triggered.connect(lambda _=False, h=handler: h())
             menu.addAction(action)
+        edit = self.menuBar().addMenu("&Edit")
+        undo = self.model.undo_stack.createUndoAction(self, "&Undo")
+        undo.setShortcut(QKeySequence.Undo)
+        redo = self.model.undo_stack.createRedoAction(self, "&Redo")
+        redo.setShortcut(QKeySequence.Redo)
+        edit.addActions([undo, redo])
         render = self.menuBar().addMenu("&Render")
         export = QAction("&Export", self)
         export.setShortcut("Ctrl+E")

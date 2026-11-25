@@ -10,10 +10,12 @@ import pytest
 pytest.importorskip("PySide6")
 
 from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtGui import QKeySequence
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QSpinBox
 
 from moshflow.api import BoolParam, ChoiceParam, FloatParam, IntParam
+from moshflow.core.project import Transition
 from moshflow.ui.inspector import make_param_widget
 from moshflow.ui.main_window import MainWindow
 from moshflow.ui.model import CLIP, TRANSITION
@@ -28,13 +30,12 @@ def app():
 @pytest.fixture
 def window(app, tmp_path):
     win = MainWindow()
-    win.model.dirty = False
     win.show()
     paths = [make_video(tmp_path / f"{name}.mp4", value) for name, value in (("a", 40), ("b", 120), ("c", 200))]
     assert win.model.import_media(paths) == []
     win.paths = paths
     yield win
-    win.model.dirty = False
+    win.model.undo_stack.setClean()     # no "Save changes?" question on close
     win.close()
 
 
@@ -122,7 +123,7 @@ def test_delete_key_removes_the_selected_clip(window):
     click(window, (CLIP, 0))
     QTest.keyClick(window.timeline, Qt.Key_Delete)
     assert [os.path.basename(c.path) for c in window.model.project.clips] == ["b.mp4"]
-    assert window.model.project.transitions == []
+    assert window.model.project.transitions == ()
 
 
 def test_param_widget_factory():
@@ -138,7 +139,7 @@ def test_param_widget_factory():
 def test_export_runs_in_the_background(app, window, tmp_path):
     window.model.add_clip(window.paths[0])
     window.model.add_clip(window.paths[1])
-    window.model.project.transitions[0].effect = "crossfade"
+    window.model.set_transition(0, Transition("crossfade"), "effect")
     output = tmp_path / "out.mp4"
     bar = window.export_bar
     bar.run_worker(str(output))
@@ -162,16 +163,84 @@ def test_cancel_export_leaves_no_file(app, window, tmp_path):
 def test_project_save_and_open(window, tmp_path):
     window.model.add_clip(window.paths[0])
     window.model.add_clip(window.paths[1])
-    window.model.project.transitions[0].duration = 2.5
+    window.model.set_transition(0, Transition(duration=2.5), "duration")
     path = str(tmp_path / "demo.moshproj")
     window.model.save_project(path)
     assert not window.model.dirty
     window.model.new_project()
-    assert window.model.project.clips == [] and window.media_bin.list.count() == 0
+    assert window.model.project.clips == () and window.media_bin.list.count() == 0
     assert window.model.open_project(path) == []
     assert window.model.project.transitions[0].duration == 2.5
     assert window.media_bin.list.count() == 2
     assert len(window.timeline._clip_rects) == 2
+
+
+def clip_names(window):
+    return [os.path.basename(c.path) for c in window.model.project.clips]
+
+
+def test_undo_and_redo_timeline_edits(window):
+    stack = window.model.undo_stack
+    for path in window.paths:
+        window.model.add_clip(path)
+    window.model.move_clip(0, 2)
+    window.model.remove_clip(0)
+    assert clip_names(window) == ["c.mp4", "a.mp4"]
+    stack.undo()
+    assert clip_names(window) == ["b.mp4", "c.mp4", "a.mp4"]
+    stack.undo()
+    assert clip_names(window) == ["a.mp4", "b.mp4", "c.mp4"]
+    stack.redo()
+    assert clip_names(window) == ["b.mp4", "c.mp4", "a.mp4"]
+    while stack.canUndo():
+        stack.undo()
+    assert clip_names(window) == [] and not window.model.dirty
+
+
+def test_one_slider_drag_is_one_undo_step(window):
+    window.model.add_clip(window.paths[0])
+    window.model.add_clip(window.paths[1])
+    click(window, (TRANSITION, 0))
+    effect_box = window.inspector.findChildren(QComboBox)[0]
+    effect_box.setCurrentIndex(effect_box.findData("crossfade"))
+    ease = window.inspector.findChildren(QDoubleSpinBox)[-1]     # Duration first, then the effect's "ease"
+    for value in (1.5, 2.0, 2.5):
+        ease.setValue(value)
+    assert window.model.project.transitions[0].params == {"ease": 2.5}
+    window.model.undo_stack.undo()
+    assert window.model.project.transitions[0].effect == "crossfade"
+    assert window.model.project.transitions[0].params == {}
+    assert window.inspector.findChildren(QDoubleSpinBox)[-1].value() == 1.0   # the Inspector shows it too
+
+
+def test_undo_restores_export_settings(window):
+    bar = window.export_bar
+    bar.width_spin.setValue(320)
+    bar.height_spin.setValue(180)
+    assert (window.model.project.output.width, window.model.project.output.height) == (320, 180)
+    window.model.undo_stack.undo()
+    assert window.model.project.output.width is None
+    assert (bar.width_spin.value(), bar.height_spin.value()) == (0, 0)
+
+
+def test_saving_marks_the_project_clean(window, tmp_path):
+    window.model.add_clip(window.paths[0])
+    assert window.model.dirty and window.windowTitle().startswith("Untitled *")
+    window.model.save_project(str(tmp_path / "p.moshproj"))
+    assert not window.model.dirty and "*" not in window.windowTitle()
+    window.model.add_clip(window.paths[1])
+    window.model.undo_stack.undo()
+    assert not window.model.dirty and "*" not in window.windowTitle()
+
+
+def test_edit_menu_has_undo_and_redo(window):
+    actions = {a.text().replace("&", ""): a for a in window.menuBar().actions()}
+    edit = {a.text().replace("&", "").split(" ")[0]: a for a in actions["Edit"].menu().actions()}
+    assert edit["Undo"].shortcut() == QKeySequence(QKeySequence.Undo)
+    window.model.add_clip(window.paths[0])
+    assert edit["Undo"].isEnabled() and "Add clip" in edit["Undo"].text()
+    edit["Undo"].trigger()
+    assert window.model.project.clips == ()
 
 
 def test_relative_output_goes_next_to_the_first_clip(window):

@@ -34,6 +34,9 @@ On Windows, use `.venv\Scripts\` instead of `.venv/bin/`.
    and parameters in the Inspector.
 4. Press **Export**. The video is written in the background.
 
+**Edit > Undo** (Ctrl+Z) and **Redo** (Ctrl+Shift+Z) work for every change to the
+timeline, the Inspector and the export settings. One slider drag is one undo step.
+
 ## Write an effect
 
 The full contract is in [`docs/API.md`](docs/API.md). Team members using Claude Code
