@@ -2,8 +2,8 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
-.venv/
-venv/
+.venv
+venv
 
 # Visual Studio
 .vs/
@@ -16,3 +16,6 @@ venv/
 # Renders made while testing (sample clips stay tracked)
 test.mp4
 output.mp4
+
+# Claude Code personal settings
+.claude/settings.local.json
