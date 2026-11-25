@@ -298,3 +298,34 @@ def test_timeline_zoom_scales_clip_widths(window):
     assert window.timeline._pixels_per_second > before
     window.timeline.zoom_out()
     assert abs(window.timeline._pixels_per_second - before) < 1e-6
+
+
+def test_launcher_falls_back_to_local_venv(monkeypatch, tmp_path):
+    import run as launcher
+
+    fake_venv = tmp_path / ".venv" / "Scripts" / "python.exe"
+    fake_venv.parent.mkdir(parents=True)
+    fake_venv.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(launcher, "ROOT", tmp_path)
+    monkeypatch.setattr(launcher, "_missing_packages", lambda: ["PySide6"])
+    monkeypatch.setattr(launcher, "_python_is_ready", lambda p: p == fake_venv)
+    monkeypatch.delenv(launcher.REEXEC_GUARD, raising=False)
+    called = []
+    monkeypatch.setattr(launcher, "_reexec", lambda exe, args: called.append((exe, args)) or 0)
+
+    assert launcher.launch(["--flag"]) == 0
+    assert called == [(fake_venv, ["--flag"])]
+
+
+def test_launcher_prints_guide_when_python_too_old(monkeypatch, capsys):
+    import run as launcher
+
+    monkeypatch.setattr(launcher.sys, "version_info", (3, 9, 13, "final", 0))
+    monkeypatch.setattr(launcher, "_missing_packages", lambda: [])
+    monkeypatch.setattr(launcher, "_find_ready_venv", lambda root: None)
+
+    assert launcher.launch([]) == 1
+    err = capsys.readouterr().err
+    assert "Python 3.10" in err
+    assert "requirements.txt" in err
