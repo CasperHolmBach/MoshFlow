@@ -30,22 +30,22 @@ signal processing. Breaking this rule can fail the whole project.
 | Area | Owner |
 | --- | --- |
 | `moshflow/api/`, `core/`, `app/`, `ui/`, `videoio/`, `toolkit/`, `cli.py`, `tests/` | Yuhyeon Cha (team leader) |
-| `moshflow/effects/keyframe_drop.py` | Nicolai Hansen |
-| `moshflow/effects/motion_bloom.py`, test clips and demo reel | Viktor Tost |
-| `moshflow/effects/liquid_melt.py` | Casper Bach |
+| One effect file each in `moshflow/effects/` | Casper Bach, Nicolai Hansen, Viktor Tost |
+| Test clips and demo reel | Viktor Tost |
 
-Work in the files of the person you are helping. Do not change `moshflow/api/`
-(API v1 is frozen) or another member's files; if that seems necessary, say so and
-let the user ask Yuhyeon. A new shared helper goes in a new file in `moshflow/toolkit/`.
+Each member chooses what their effect does; the only requirement is the API in
+`docs/API.md`. Work in the files of the person you are helping. Do not change
+`moshflow/api/` (API v1 is frozen) or another member's files; if that seems
+necessary, say so and let the user ask Yuhyeon. A new shared helper goes in a new
+file in `moshflow/toolkit/`.
 
 ## Git
 
 The repository is `github.com/Fnhid/MoshFlow`. The habits below are optional;
 use whatever works for the person you are helping.
 
-- A branch per person keeps work apart, for example `effect/keyframe-drop`
-  (Nicolai), `effect/motion-bloom` (Viktor), `effect/liquid-melt` (Casper), and
-  `core/<topic>` or `ui/<topic>` (Yuhyeon).
+- A branch per person keeps work apart, for example `effect/<your-effect>` for an
+  effect and `core/<topic>` or `ui/<topic>` for Yuhyeon's work.
 - Keeping an effect branch to that effect's file makes merging easy.
 - Before merging into `main`, bring in the latest `main`
   (`git fetch origin` then `git merge origin/main`) and run `python -m pytest`,
@@ -66,12 +66,13 @@ One file in `moshflow/effects/`, one `TransitionEffect` subclass with `@register
 `ctx.seed` for any randomness, check `progress.cancelled` in every loop, and
 declare every tunable value in `param_specs()`. No file I/O, UI calls or global state.
 
-The three effects are skeletons with the planned names, parameters and `TODO`
-steps; fill in those steps and do not rename their ids. The helpers they need
-already work: `toolkit/motion.py` (`estimate`, `to_field`, `smooth_field`) and
-`toolkit/warp.py` (`warp`). Do not change their signatures or the vector
-convention, because all three effects depend on them. When an effect works,
-remove `(draft)` from its name.
+Keyframe Drop, Motion Bloom and Liquid Melt are optional sample skeletons. A member
+may finish one, change it, or delete it and write something else; nobody has to
+implement them. Once an effect id has been used in a saved project, keep it stable.
+The shared helpers work: `toolkit/motion.py` (`estimate`, `to_field`,
+`smooth_field`) and `toolkit/warp.py` (`warp`). Do not change their signatures or
+the vector convention, because other effects may depend on them. When an effect
+works, remove `(draft)` from its name.
 
 Vector convention (from `docs/API.md`): `v = (dx, dy)` means
 `current(x, y) ≈ reference(x + dx, y + dy)`, and warping is backward:

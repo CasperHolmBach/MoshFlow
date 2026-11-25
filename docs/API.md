@@ -33,10 +33,9 @@ the video files, the encoder or the project file.
 | `moshflow/toolkit/frames.py` | `window_frames`, `last_clean_a` | Yuhyeon Cha |
 | `moshflow/toolkit/motion.py` | `estimate`, `to_field`, `smooth_field` | Yuhyeon Cha |
 | `moshflow/toolkit/warp.py` | `warp` | Yuhyeon Cha |
-| `moshflow/effects/keyframe_drop.py` | Keyframe Drop (skeleton) | Nicolai Hansen |
-| `moshflow/effects/motion_bloom.py` | Motion Bloom (skeleton) | Viktor Tost |
-| `moshflow/effects/liquid_melt.py` | Liquid Melt (skeleton) | Casper Bach |
 | `moshflow/effects/hard_cut.py`, `crossfade.py` | Working reference effects | Yuhyeon Cha |
+| `moshflow/effects/keyframe_drop.py`, `motion_bloom.py`, `liquid_melt.py` | Optional sample skeletons | Anyone |
+| `moshflow/effects/<your_effect>.py` | Your own effect | Its author |
 
 ## Frames
 
@@ -175,7 +174,7 @@ Helpers that more than one effect needs. They use plain NumPy arithmetic only.
 
 ### Motion vectors (motion.py and warp.py)
 
-All three effects depend on these conventions, so they stay fixed.
+Effects that use these helpers depend on these conventions, so they stay fixed.
 
 - A vector `v = (dx, dy)` says where a pixel came from:
   `current(x, y) ≈ reference(x + dx, y + dy)`. An object that moved 2 pixels to the
@@ -203,11 +202,13 @@ Speed: on a 1280 × 720 frame, `estimate` with block 16 and search 8 takes about
 on every second pixel (`luma[::2, ::2]`, with half the block and search) and double
 the vectors.
 
-## The three effects (skeletons)
+## Sample skeletons (optional)
 
-Each file already registers its effect with the planned parameters, so it appears
-in the Inspector and passes the contract test. `render` is a plain cut for now; the
-`TODO` comments give the steps from the Survey & Plan, Section 13.
+Each member writes the effect they want; it only has to follow this API. The three
+files below are optional starting points: each registers an effect with example
+parameters, so it appears in the Inspector and passes the contract test. `render`
+is a plain cut, and the `TODO` comments give one possible design from the Survey &
+Plan, Section 13. Finish one, change it, or delete the file.
 
 | Effect | id | Parameters |
 | --- | --- | --- |
