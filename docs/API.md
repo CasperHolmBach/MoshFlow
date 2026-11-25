@@ -4,8 +4,8 @@ This is the contract between the core (Yuhyeon Cha) and the effects. It is froze
 as API v1: effects may rely on everything below, and the core will not change it
 without agreeing with the team first.
 
-The code is the source of truth: `moshflow/api/` and `moshflow/toolkit/`. This page
-explains it in one place.
+If this page and the code disagree, the code in `moshflow/api/` and
+`moshflow/toolkit/` is right.
 
 ## Where an effect sits
 
@@ -40,10 +40,10 @@ the video files, the encoder or the project file.
 
 ## Frames
 
-A `Frame` is a NumPy array of shape `(H, W, 3)`, dtype `uint8`, in **BGR** order
+A `Frame` is a NumPy array of shape `(H, W, 3)`, dtype `uint8`, in BGR order
 (OpenCV's order). Every frame an effect reads and yields has the project size.
 
-Frames handed to an effect are **read-only**. Convert before doing maths:
+Frames handed to an effect are read-only. Convert before doing maths:
 
 ```python
 picture = clip.frame(i).astype(np.float32)   # a new, writable copy
@@ -91,8 +91,8 @@ The windows come from the transition's duration and alignment:
 | `center` | last n // 2 frames of A | first n - n // 2 frames of B |
 | `after` | empty | first n frames of B |
 
-An effect may read **any** frame of either clip, not only the windows. For example,
-a datamosh starts from the last clean frame of A before the window. Either window
+An effect may read any frame of either clip, including frames outside the windows.
+A datamosh, for example, starts from the last clean frame of A before the window. Either window
 can be empty, and a window can cover a whole clip.
 
 ## TransitionEffect
@@ -175,15 +175,15 @@ Helpers that more than one effect needs. They use plain NumPy arithmetic only.
 
 ### Motion vectors (motion.py and warp.py)
 
-These conventions are fixed. All three effects depend on them.
+All three effects depend on these conventions, so they stay fixed.
 
-- A vector `v = (dx, dy)` says **where a pixel came from**:
+- A vector `v = (dx, dy)` says where a pixel came from:
   `current(x, y) ≈ reference(x + dx, y + dy)`. An object that moved 2 pixels to the
   right has `v = (-2, 0)`.
-- **Block vectors**: int32, shape `(rows, cols, 2)`, with
-  `rows = ceil(H / block)`, `cols = ceil(W / block)`. `[..., 0]` is dx, `[..., 1]` is dy.
+- Block vectors are int32 with shape `(rows, cols, 2)`, where
+  `rows = ceil(H / block)` and `cols = ceil(W / block)`. `[..., 0]` is dx, `[..., 1]` is dy.
   The last row and column of blocks may be smaller than `block × block`.
-- **Field**: float32, shape `(H, W, 2)`, one vector per pixel, same order.
+- A field is float32 with shape `(H, W, 2)`: one vector per pixel, in the same order.
 
 | Function | Does |
 | --- | --- |
@@ -247,5 +247,5 @@ python -m moshflow.cli try --effect keyframe_drop a.mp4 b.mp4 -o test.mp4 --para
 ## Changing the API
 
 API v1 is frozen. If an effect needs something the API does not offer, ask Yuhyeon
-first. Most needs can be met inside the effect file or in a new toolkit helper,
-which does not change the API.
+first. An effect can usually do what it needs inside its own file or with a new
+toolkit helper, and neither changes the API.

@@ -7,10 +7,10 @@ on a timeline, picks a datamosh transition for every cut, and exports one video.
 Read `docs/API.md` before changing any effect or toolkit code. It is the contract
 between the core and the effects.
 
-## The library rule comes first
+## Library rule
 
-Breaking it can fail the whole project. Apart from OpenCV video input and output,
-no library function may do image or signal processing.
+Apart from OpenCV video input and output, no library function may do image or
+signal processing. Breaking this rule can fail the whole project.
 
 - OpenCV (`cv2`) is used only in `moshflow/videoio/`, and only `VideoCapture`,
   `VideoWriter` and `CAP_PROP_*`. Never add a `cv2` call anywhere else.
@@ -40,7 +40,7 @@ let the user ask Yuhyeon. A new shared helper goes in a new file in `moshflow/to
 
 ## Git
 
-The repository is `github.com/Fnhid/MoshFlow`. These are suggestions, not rules;
+The repository is `github.com/Fnhid/MoshFlow`. The habits below are optional;
 use whatever works for the person you are helping.
 
 - A branch per person keeps work apart, for example `effect/keyframe-drop`

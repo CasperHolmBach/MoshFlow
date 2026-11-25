@@ -36,7 +36,7 @@ On Windows, use `.venv\Scripts\` instead of `.venv/bin/`.
 
 ## Work together
 
-A suggested split, not a rule:
+Suggested branches (optional):
 
 | Branch | Who | Main file |
 | --- | --- | --- |
