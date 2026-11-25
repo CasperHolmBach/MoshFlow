@@ -1,10 +1,11 @@
-"""Liquid Melt (owner: Casper Bach).
+"""Liquid Melt: an optional sample skeleton.
 
 A lost I-frame with smooth motion in place of blocks (Survey & Plan, 13.3):
 clip B's motion becomes a smooth flow, so clip A's picture streams like a
 liquid before it fades into clip B.
 
-SKELETON: render() is a plain cut until the TODO steps are written. When the
+SKELETON: render() is a plain cut until the TODO steps are written. Finish it,
+change it, or delete this file and write your own effect. When the
 effect works, remove "(draft)" from its name.
 """
 
@@ -18,7 +19,7 @@ SEARCH = 8    # search range for the block matching; may become a parameter
 
 @register
 class LiquidMelt(TransitionEffect):
-    info = EffectInfo("liquid_melt", "Liquid Melt (draft)", "Casper Bach",
+    info = EffectInfo("liquid_melt", "Liquid Melt (draft)", "Sample",
                       "Clip A's picture flows like a liquid along clip B's motion, then fades into B.")
 
     @classmethod
@@ -39,13 +40,13 @@ class LiquidMelt(TransitionEffect):
                 return
             current = clip.frame(index).astype(np.float32)
 
-            # TODO(Casper) Step 1: block motion between the previous and the current source
+            # TODO Step 1: block motion between the previous and the current source
             # frame, turned into a smooth per-pixel flow:
             #   vectors = motion.estimate(color.bgr_to_y(previous), color.bgr_to_y(current), p["block"], SEARCH)
             #   flow = motion.smooth_field(vectors, ctx.size, p["block"], p["smoothness"])
-            # TODO(Casper) Step 2: move the picture along the flow with bilinear sampling:
+            # TODO Step 2: move the picture along the flow with bilinear sampling:
             #   picture = warp.warp(picture, p["strength"] * flow, sampling="bilinear")
-            # TODO(Casper) Step 3: over the last `fade` share of the window, blend towards clip B.
+            # TODO Step 3: over the last `fade` share of the window, blend towards clip B.
             picture = current  # placeholder: a plain cut until the steps above exist
 
             previous = current
