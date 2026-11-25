@@ -15,6 +15,7 @@ from moshflow.toolkit import color, frames, motion, warp
 
 BLOCK = 16    # block size and search range for capturing the motion
 SEARCH = 8
+FADE_PART = 1 / 3   # share of the transition that the "fade" release blends into clip B
 
 
 @register
@@ -35,15 +36,35 @@ class MotionBloom(TransitionEffect):
         p = ctx.params
         field = _captured_field(ctx, p["source"])
         picture = frames.last_clean_a(ctx).astype(np.float32)
-        for i in range(ctx.length):
+        fade_length = max(1, round(ctx.length * FADE_PART)) if p["release"] == "fade" else 0
+        for i, (clip, index) in enumerate(frames.window_frames(ctx)):
             if progress.cancelled:
                 return
             # The same motion again, a little weaker every frame.
             strength = p["gain"] * (1.0 - p["decay"]) ** i
             picture = warp.warp(picture, strength * field)
 
+            out = picture
+            if fade_length:
+                # Over the last frames, each pixel moves linearly from the bloom to B:
+                # out = (1 - w) * bloom + w * B, with w reaching 1 on the last frame.
+                w = min(max((i + 1 - (ctx.length - fade_length)) / fade_length, 0.0), 1.0)
+                if w > 0:
+                    out = (1.0 - w) * picture + w * _clip_b_frame(ctx, clip, index)
+
             progress.report(i + 1, ctx.length)
-            yield color.to_uint8(picture)
+            yield color.to_uint8(out)
+
+
+def _clip_b_frame(ctx, clip, index: int) -> np.ndarray:
+    """The frame of B that output frame shows when there is no effect.
+
+    Inside B's window that is B's own frame; inside A's window it is B's first
+    frame, the one the video cuts to right after the transition.
+    """
+    if clip is ctx.incoming:
+        return clip.frame(index).astype(np.float32)
+    return ctx.incoming.frame(ctx.b_window.start).astype(np.float32)
 
 
 def _captured_field(ctx, source: str) -> np.ndarray:
