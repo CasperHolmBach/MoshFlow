@@ -121,3 +121,19 @@ Source code is due on Nov 28, 2026, 10 PM, as `Team3_MoshFlow_Src.zip`.
   where it stays readable.
 - Explain image-processing choices at the pixel level (what happens to one pixel
   value), because the professor asks questions that way.
+
+## Skills
+
+Project skills live in `.claude/skills/`. Claude Code loads them when you start it
+inside this repository; type the name as a command (for example `/new-effect`) or
+just describe the task.
+
+| Skill | Use it to |
+| --- | --- |
+| `/new-effect` | Write your own effect, finish a sample skeleton, or fix a contract-test failure |
+| `/check-library-rule` | Check a change against the course library rule before a commit or pull request |
+| `/run-moshflow` | Run the app without a screen, take screenshots, export a transition and look at its frames |
+| `/humanizer` | Make README, docs, reports or pull request text read like a person wrote it |
+
+Use `/check-library-rule` before every pull request that touches `moshflow/`, and
+`/run-moshflow` to see an effect's output instead of guessing from the code.
