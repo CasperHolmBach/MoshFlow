@@ -1,8 +1,8 @@
-"""Motion Bloom: clip B's P-frames are played on clip A's last picture.
+"""Motion Bloom: clip B's P-frames, each repeated, are played on clip A's last picture.
 
-Emulates the classic datamosh, as moshy's pdupe does on real video files:
-clip B's I-frame is dropped, so B's P-frames are decoded on top of A's last
-picture, and one P-frame is repeated many times to make the bloom.
+Emulates the classic datamosh transition: clip B's I-frame is dropped, so B's
+P-frames are decoded on top of A's last picture, and P-frames are duplicated
+(as moshy's pdupe and ppulse do on real video files) so the motion blooms.
 
 A P-frame here is what a codec stores: a motion field F (one vector per pixel,
 measured by block matching: F(x) says where the content at x came from) and a
@@ -14,19 +14,22 @@ E(x) = B_next(x) - B_prev(x + F(x)). Decoding it onto a picture P gives
 so each pixel is copied from where the motion says and then gets the same
 colour difference that B had at that spot.
 
-- Bloom (A's part of the window): one P-frame of B is decoded again and again,
-  so moving areas of A's picture keep stretching and swelling. Like a pdupe
-  user picking a good frame, it is the P-frame in B's first second with the most
-  motion and the least residual, and only a little of its residual is repeated:
-  repeating a full residual dozens of times burns the colours out.
-- Drag (B's part of the window): B's real P-frames, one per frame, keep moving
-  the picture with B's motion and paint B's changes into it. A's ghost survives
-  where B is still.
-- Emerge: on top of each of B's P-frames, every pixel also moves a step towards
-  B's real frame: P += h (B - P). h grows over the drag and is larger where B's
-  residual is large (where B changes), so B appears out of the mosh while it is
-  already moving, starting where it moves, instead of starting clean. On the
-  last frame h = 1, so the transition lands exactly on B.
+The transition, frame by frame:
+- It starts from A's last clean picture.
+- B's P-frames, from B's first frame up to the end of B's window, are spread over
+  the whole transition: output frame i shows P-frame j = m u^2, with m P-frames
+  and u = (i + 1) / length. The first ones are decoded many times in a row;
+  repeating the motion makes it bloom, so moving areas keep stretching and
+  swelling. Later ones come one per frame, so B is at its normal speed when the
+  transition ends, and the picture never stops moving in between. The residual is added only on the first copy;
+  adding it again on every copy would burn the colours out.
+- Emerge: after every frame, each pixel also moves a step towards B's real frame
+  at that point: P += h (B - P). h grows from 0 to 1 over the transition and is
+  larger where B's residual is large (where B changes), so B grows out of the
+  same motion that smears A, starting where B moves. On the last frame h = 1,
+  and the video carries on with B's next real frame.
+- With no B window (alignment "before"), B has no P-frames before its first
+  frame, so B's cleanest early P-frame is repeated instead.
 
 Block matching is noisy in flat or blurry areas, and a wrong vector repeated
 many times becomes a random streak, so vectors that do not explain the motion
@@ -43,23 +46,20 @@ from moshflow.toolkit import color, motion, warp
 BLOCK = 16           # block size and search range of the motion, at full size
 SEARCH = 8
 CONFIDENCE = 0.7     # keep a block's vector only if it cuts the block's error to below 70 %
-LOOK_AHEAD = 30      # B frame pairs searched for the P-frame to repeat
+LOOK_AHEAD = 30      # B frame pairs searched for the P-frame to repeat (no B window)
 RESIDUAL_COST = 0.3  # how much residual counts against motion when picking that P-frame
-BLOOM_RESIDUAL = 0.1 # share of the residual kept while one P-frame is repeated
 CHANGE_FULL = 16.0   # residual (in grey levels) at which a pixel emerges fastest
-EMERGE_PART = 1 / 3  # with no B window, the share of the end in which B emerges
 
 
 @register
 class MotionBloom(TransitionEffect):
     info = EffectInfo("motion_bloom", "Motion Bloom (draft)", "Viktor Tost",
-                      "Clip B's P-frames play on clip A's last picture; one repeats until it blooms.")
+                      "Clip B's P-frames, each repeated, play on clip A's last picture until B emerges.")
 
     @classmethod
     def param_specs(cls):
         return [
             FloatParam("gain", "Gain", 1.0, 0.0, 4.0),
-            FloatParam("decay", "Decay", 0.0, 0.0, 0.5),
             FloatParam("residual", "Residual", 1.0, 0.0, 2.0),
             FloatParam("emerge", "Emerge", 1.0, 0.0, 3.0),
         ]
@@ -68,47 +68,58 @@ class MotionBloom(TransitionEffect):
         p = ctx.params
         b = ctx.incoming
         picture = _last_clean_a(ctx).astype(np.float32)
-        first_b = min(ctx.b_window.start, len(b) - 1)
-        field, error = _bloom_p_frame(b, first_b, ctx.size)
-        error = BLOOM_RESIDUAL * error
+        pairs = _b_pairs(ctx)
+        if not pairs:
+            field, error = _bloom_p_frame(b, ctx.b_window.start, ctx.size)
 
-        a_frames = len(ctx.a_window)
-        # B emerges during B's window, or at the end if the transition has none.
-        emerge_from = a_frames if len(ctx.b_window) else round(ctx.length * (1 - EMERGE_PART))
+        current, change = -1, np.zeros(picture.shape[:2], np.float32)
         for i in range(ctx.length):
             if progress.cancelled:
                 return
-            if i < a_frames:
-                # Bloom: the same P-frame again, a little weaker every frame with decay.
-                strength = (1.0 - p["decay"]) ** i
-                index = first_b
+            if pairs:
+                # The P-frame of B that this output frame shows: j = m u^2. Early ones
+                # stay for many frames in a row (duplicated, the bloom); towards the end
+                # one P-frame per frame, so B reaches its normal speed as it lands.
+                j = min(int(len(pairs) * ((i + 1) / ctx.length) ** 2), len(pairs) - 1)
+                first_copy = j != current
+                if first_copy:
+                    current = j
+                    field, error = _p_frame(b, *pairs[j], ctx.size)
+                    change = np.minimum(np.abs(color.bgr_to_y(error)) / CHANGE_FULL, 1.0)
+                target_index = pairs[j][1]
             else:
-                # Drag: B's own next P-frame. A repeated (duplicate) frame carries no
-                # P-frame of its own, so the previous motion carries on without residual.
-                strength = 1.0
-                index = ctx.b_window[i - a_frames]
-                if index == 0:
-                    pass
-                elif _same(b.frame(index - 1), b.frame(index)):
-                    error = np.zeros_like(error)
-                else:
-                    field, error = _p_frame(b, index - 1, index, ctx.size)
+                first_copy = i == 0
+                target_index = min(ctx.b_window.start, len(b) - 1)
 
-            picture = (warp.warp(picture, strength * p["gain"] * field, "bilinear")
-                       + strength * p["residual"] * error)
+            picture = warp.warp(picture, p["gain"] * field, "bilinear")
+            if first_copy:
+                picture = picture + p["residual"] * error
             picture = np.clip(picture, 0.0, 255.0)
 
-            if i >= emerge_from:
-                target = b.frame(index).astype(np.float32)
-                u = (i + 1 - emerge_from) / (ctx.length - emerge_from)
-                change = np.minimum(np.abs(color.bgr_to_y(error)) / CHANGE_FULL, 1.0)
-                h = np.minimum(p["emerge"] * u * u * (0.25 + 0.75 * change), 1.0)
-                if i == ctx.length - 1:
-                    h = np.ones_like(h)
-                picture = picture + h[..., None] * (target - picture)
+            # Emerge: a step towards B's real frame, bigger later and where B changes.
+            u = (i + 1) / ctx.length
+            h = np.minimum(p["emerge"] * u * u * (0.25 + 0.75 * change), 1.0)
+            if i == ctx.length - 1:
+                h = np.ones_like(h)
+            picture = picture + h[..., None] * (b.frame(target_index).astype(np.float32) - picture)
 
             progress.report(i + 1, ctx.length)
             yield color.to_uint8(picture)
+
+
+def _b_pairs(ctx) -> list[tuple[int, int]]:
+    """B's P-frames up to the end of its window, as (previous, next) frame pairs.
+
+    Repeated (duplicate) frames carry no P-frame of their own and are skipped.
+    """
+    b = ctx.incoming
+    last = min(ctx.b_window.stop, len(b)) - 1
+    pairs, previous = [], 0
+    for index in range(1, last + 1):
+        if not _same(b.frame(previous), b.frame(index)):
+            pairs.append((previous, index))
+            previous = index
+    return pairs
 
 
 def _last_clean_a(ctx) -> np.ndarray:
