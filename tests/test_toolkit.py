@@ -76,6 +76,57 @@ def test_estimate_matches_the_slide_example():
     assert tuple(vectors[1, 1]) == (-1, -1)
 
 
+def _reference_sad_estimate(reference: np.ndarray, current: np.ndarray, block: int, search: int) -> np.ndarray:
+    height, width = current.shape
+    rows, cols = -(-height // block), -(-width // block)
+    out = np.zeros((rows, cols, 2), np.int32)
+    span = range(-search, search + 1)
+    candidates = sorted(((dx, dy) for dy in span for dx in span), key=lambda d: abs(d[0]) + abs(d[1]))
+    for r in range(rows):
+        y0, y1 = r * block, min((r + 1) * block, height)
+        for c in range(cols):
+            x0, x1 = c * block, min((c + 1) * block, width)
+            cur = current[y0:y1, x0:x1]
+            best_sad = np.inf
+            best_v = (0, 0)
+            for dx, dy in candidates:
+                if y0 + dy < 0 or y1 + dy > height or x0 + dx < 0 or x1 + dx > width:
+                    continue
+                sad = float(np.abs(cur - reference[y0 + dy:y1 + dy, x0 + dx:x1 + dx]).sum())
+                if sad < best_sad:
+                    best_sad = sad
+                    best_v = (dx, dy)
+            out[r, c] = best_v
+    return out
+
+
+@pytest.mark.parametrize("shape,block,search", [
+    ((30, 50), 16, 6),      # partial bottom and right blocks
+    ((10, 12), 16, 4),      # smaller than one block
+    ((37, 41), 8, 10),      # search larger than block
+    ((24, 24), 8, 0),       # zero search range
+])
+def test_estimate_matches_exact_full_search_on_edge_cases(shape, block, search):
+    rng = np.random.default_rng(42)
+    reference = rng.integers(0, 256, shape, dtype=np.uint8).astype(np.float32)
+    current = np.roll(reference, (2, -3), axis=(0, 1))
+    reference.flags.writeable = False
+    current.flags.writeable = False
+    got = call(motion.estimate, reference, current, block, search)
+    expected = _reference_sad_estimate(reference, current, block, search)
+    assert np.array_equal(got, expected)
+
+
+def test_estimate_threaded_path_matches_single_band():
+    # Large enough to exercise the threaded band path, with a non-divisible height.
+    rng = np.random.default_rng(11)
+    reference = rng.integers(0, 256, (180, 260), dtype=np.uint8).astype(np.float32)
+    current = np.roll(reference, (-4, 5), axis=(0, 1))
+    got = call(motion.estimate, reference, current, 16, 6)
+    expected = _reference_sad_estimate(reference, current, 16, 6)
+    assert np.array_equal(got, expected)
+
+
 # --- motion.to_field / smooth_field -------------------------------------------
 
 def test_to_field_gives_every_pixel_its_block_vector():

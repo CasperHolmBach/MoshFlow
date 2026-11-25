@@ -10,7 +10,13 @@ Conventions (see docs/API.md, "Motion vectors"):
 - A field: float32 array of shape (H, W, 2), one vector per pixel, same order.
 """
 
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
+
+_MAX_WORKERS = 8
+_THREAD_MIN_WORK = 2_000_000  # pixels * candidates needed to outweigh thread startup
 
 
 def estimate(reference: np.ndarray, current: np.ndarray, block: int, search: int) -> np.ndarray:
@@ -30,19 +36,32 @@ def estimate(reference: np.ndarray, current: np.ndarray, block: int, search: int
     left = np.arange(cols) * block
     right = np.minimum(left + block, width)
 
-    # One shift of the whole frame per candidate: a slice of the padded reference.
-    padded = _pad_edges(reference.astype(np.float32), search)
-    current = current.astype(np.float32)
-    best_sad = np.full((rows, cols), np.inf, np.float32)
+    # One shift of the frame per candidate: a slice of the padded reference.
+    ref_pad = np.ascontiguousarray(_pad_edges(reference.astype(np.float32), search))
+    cur_f = np.ascontiguousarray(current, dtype=np.float32)
+    candidates = _candidates(search)
     best = np.zeros((rows, cols, 2), np.int32)
-    for dx, dy in _candidates(search):
-        shifted = padded[search + dy:search + dy + height, search + dx:search + dx + width]
-        sad = _block_sums(np.abs(current - shifted), block, rows, cols)
-        inside = (((top + dy >= 0) & (bottom + dy <= height))[:, None]
-                  & ((left + dx >= 0) & (right + dx <= width))[None, :])
-        better = inside & (sad < best_sad)
-        best_sad[better] = sad[better]
-        best[better] = (dx, dy)
+
+    row_slices = {dy: _valid_span(top, bottom, height, dy) for dy in range(-search, search + 1)}
+    col_slices = {dx: _valid_span(left, right, width, dx) for dx in range(-search, search + 1)}
+
+    workers = min(rows, os.cpu_count() or 1, _MAX_WORKERS)
+    use_threads = workers > 1 and height * width * len(candidates) >= _THREAD_MIN_WORK
+    band_count = workers if use_threads else 1
+    band_rows = -(-rows // band_count)
+    bands = [(r0, min(r0 + band_rows, rows)) for r0 in range(0, rows, band_rows)]
+
+    def run_band(band: tuple[int, int]) -> None:
+        _estimate_band(
+            ref_pad, cur_f, best, band, block, search, cols, candidates, row_slices, col_slices
+        )
+
+    if use_threads:
+        with ThreadPoolExecutor(max_workers=len(bands)) as pool:
+            list(pool.map(run_band, bands))
+    else:
+        for band in bands:
+            run_band(band)
     return best
 
 
@@ -83,6 +102,70 @@ def smooth_field(vectors: np.ndarray, size: tuple[int, int], block: int, smoothn
     return ((1 - smoothness) * blocky + smoothness * smooth).astype(np.float32)
 
 
+def _estimate_band(
+    ref_pad: np.ndarray,
+    current: np.ndarray,
+    best: np.ndarray,
+    band: tuple[int, int],
+    block: int,
+    search: int,
+    cols: int,
+    candidates: list[tuple[int, int]],
+    row_slices: dict[int, tuple[int, int]],
+    col_slices: dict[int, tuple[int, int]],
+) -> None:
+    """Runs full-search block matching on one horizontal slice of block rows."""
+    height, width = current.shape
+    r0, r1 = band
+    n_rows = r1 - r0
+    y0 = r0 * block
+    y1 = min(r1 * block, height)
+    bh = y1 - y0
+    cur_band = current[y0:y1]
+
+    best_sad = np.full((n_rows, cols), np.inf, np.float32)
+    best_band = best[r0:r1]
+    # Reused per-band work arrays; padding beyond (bh, width) stays zero for partial blocks.
+    diff_buf = np.zeros((n_rows * block, cols * block), np.float32)
+    diff_valid = diff_buf[:bh, :width]
+    diff_4d = diff_buf.reshape(n_rows, block, cols, block)
+    row_sum = np.empty((n_rows, block, cols), np.float32)
+    sad = np.empty((n_rows, cols), np.float32)
+
+    for dx, dy in candidates:
+        vr0, vr1 = row_slices[dy]
+        ar0 = max(r0, vr0) - r0
+        ar1 = min(r1, vr1) - r0
+        if ar0 >= ar1:
+            continue
+        c0, c1 = col_slices[dx]
+        if c0 >= c1:
+            continue
+        shifted = ref_pad[search + y0 + dy:search + y1 + dy, search + dx:search + dx + width]
+        np.subtract(cur_band, shifted, out=diff_valid)
+        np.abs(diff_valid, out=diff_valid)
+        diff_4d.sum(axis=3, out=row_sum)
+        row_sum.sum(axis=1, out=sad)
+        sad_sub = sad[ar0:ar1, c0:c1]
+        best_sub = best_sad[ar0:ar1, c0:c1]
+        better = sad_sub < best_sub
+        if better.any():
+            best_sub[better] = sad_sub[better]
+            best_band[ar0:ar1, c0:c1][better] = (dx, dy)
+
+
+def _valid_span(starts: np.ndarray, ends: np.ndarray, limit: int, delta: int) -> tuple[int, int]:
+    """Index range [first, stop) of blocks whose shifted span stays inside [0, limit]."""
+    first = 0
+    count = len(starts)
+    while first < count and int(starts[first]) + delta < 0:
+        first += 1
+    stop = count
+    while stop > first and int(ends[stop - 1]) + delta > limit:
+        stop -= 1
+    return first, stop
+
+
 def _candidates(search: int) -> list[tuple[int, int]]:
     """Every (dx, dy) in the search range, nearest to (0, 0) first, so ties keep the smaller one."""
     span = range(-search, search + 1)
@@ -95,11 +178,3 @@ def _pad_edges(image: np.ndarray, n: int) -> np.ndarray:
     ys = np.clip(np.arange(-n, height + n), 0, height - 1)
     xs = np.clip(np.arange(-n, width + n), 0, width - 1)
     return image[ys[:, None], xs[None, :]]
-
-
-def _block_sums(values: np.ndarray, block: int, rows: int, cols: int) -> np.ndarray:
-    """Sum of an H x W array over each block; partial blocks at the edges sum what they have."""
-    height, width = values.shape
-    padded = np.zeros((rows * block, cols * block), np.float32)
-    padded[:height, :width] = values
-    return padded.reshape(rows, block, cols, block).sum(axis=(1, 3))
