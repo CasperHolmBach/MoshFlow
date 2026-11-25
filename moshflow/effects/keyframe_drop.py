@@ -1,9 +1,10 @@
-"""Keyframe Drop (owner: Nicolai Hansen).
+"""Keyframe Drop: an optional sample skeleton.
 
 Emulates deleting the I-frame at the start of clip B (Survey & Plan, 13.1):
 clip B's motion drags the last picture of clip A, which slowly heals into B.
 
-SKELETON: render() is a plain cut until the TODO steps are written. When the
+SKELETON: render() is a plain cut until the TODO steps are written. Finish it,
+change it, or delete this file and write your own effect. When the
 effect works, remove "(draft)" from its name.
 """
 
@@ -15,7 +16,7 @@ from moshflow.toolkit import color, frames, motion, warp
 
 @register
 class KeyframeDrop(TransitionEffect):
-    info = EffectInfo("keyframe_drop", "Keyframe Drop (draft)", "Nicolai Hansen",
+    info = EffectInfo("keyframe_drop", "Keyframe Drop (draft)", "Sample",
                       "Clip B's motion drags the last picture of clip A, which slowly heals into B.")
 
     @classmethod
@@ -36,12 +37,12 @@ class KeyframeDrop(TransitionEffect):
                 return
             current = clip.frame(index).astype(np.float32)
 
-            # TODO(Nicolai) Step 2: motion between the previous and the current source frame,
+            # TODO Step 2: motion between the previous and the current source frame,
             # applied to our picture, then a fraction `heal` of clip B mixed back in:
             #   vectors = motion.estimate(color.bgr_to_y(previous), color.bgr_to_y(current), p["block"], p["search"])
             #   picture = warp.warp(picture, motion.to_field(vectors, ctx.size, p["block"]))
             #   picture = picture + p["heal"] * (current - picture)
-            # TODO(Nicolai) Step 3: settle into the real frames of clip B by the end of the window.
+            # TODO Step 3: settle into the real frames of clip B by the end of the window.
             picture = current  # placeholder: a plain cut until the steps above exist
 
             previous = current
