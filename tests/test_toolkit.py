@@ -1,0 +1,128 @@
+"""The expected behaviour of the shared toolkit helpers.
+
+A helper that raises NotImplementedError is skipped rather than failed, so a new
+helper can be added here before it is written.
+"""
+
+import numpy as np
+import pytest
+
+from helpers import ArraySource, moving_clip
+from moshflow.api import TransitionContext
+from moshflow.toolkit import color, frames, motion, warp
+
+
+def call(function, *args, **kwargs):
+    try:
+        return function(*args, **kwargs)
+    except NotImplementedError as e:
+        pytest.skip(f"not implemented yet: {e}")
+
+
+def luma(frame):
+    return color.bgr_to_y(frame)
+
+
+# --- frames ------------------------------------------------------------------
+
+def make_context(a_window, b_window, length=10):
+    clip_a, clip_b = ArraySource(moving_clip(length, seed=1)), ArraySource(moving_clip(length, seed=2))
+    return TransitionContext(clip_a, clip_b, a_window, b_window, params={}, seed=0)
+
+
+def test_window_frames_walks_a_then_b():
+    ctx = make_context(range(8, 10), range(0, 3))
+    order = [(clip is ctx.outgoing, index) for clip, index in frames.window_frames(ctx)]
+    assert order == [(True, 8), (True, 9), (False, 0), (False, 1), (False, 2)]
+
+
+def test_last_clean_a_is_the_frame_before_the_window():
+    ctx = make_context(range(8, 10), range(0, 3))
+    assert frames.last_clean_a(ctx) is ctx.outgoing.frame(7)
+    whole = make_context(range(0, 10), range(0, 3))
+    assert frames.last_clean_a(whole) is whole.outgoing.frame(0)
+
+
+# --- motion.estimate -----------------------------------------------------------
+
+def test_estimate_shape_covers_partial_blocks():
+    image = np.zeros((30, 50), np.float32)
+    vectors = call(motion.estimate, image, image, 16, 4)
+    assert vectors.shape == (2, 4, 2)          # ceil(30 / 16) rows, ceil(50 / 16) columns
+    assert vectors.dtype == np.int32
+
+
+def test_estimate_finds_a_shift_to_the_right():
+    clip = moving_clip(4, size=(64, 48))       # the texture moves 2 pixels right per frame
+    vectors = call(motion.estimate, luma(clip[0]), luma(clip[1]), 8, 4)
+    # Each pixel came from 2 pixels to its left: v = (-2, 0). The first column of
+    # blocks is left out, because the true source lies outside the image there.
+    assert np.array_equal(vectors[:, 1:], np.tile(np.int32([-2, 0]), (6, 7, 1)))
+
+
+def test_estimate_prefers_no_motion_on_flat_images():
+    flat = np.full((32, 32), 128, np.float32)
+    vectors = call(motion.estimate, flat, flat, 8, 3)
+    assert not vectors.any()
+
+
+def test_estimate_matches_the_slide_example():
+    # The 2 x 2 example from the proposal: the block 50 60 / 70 80 moves from (1, 1) to (2, 2).
+    reference = np.full((6, 6), 10, np.float32)
+    current = np.full((6, 6), 10, np.float32)
+    reference[1:3, 1:3] = [[50, 60], [70, 80]]
+    current[2:4, 2:4] = [[50, 60], [70, 80]]
+    vectors = call(motion.estimate, reference, current, 2, 1)
+    assert tuple(vectors[1, 1]) == (-1, -1)
+
+
+# --- motion.to_field / smooth_field -------------------------------------------
+
+def test_to_field_gives_every_pixel_its_block_vector():
+    vectors = np.int32([[[1, 0], [2, 0]], [[3, 0], [4, 0]]])     # 2 x 2 blocks of 2 x 2 pixels
+    field = call(motion.to_field, vectors, (3, 3), 2)           # a 3 x 3 image: the last blocks are partial
+    assert field.shape == (3, 3, 2) and field.dtype == np.float32
+    assert field[0, 0, 0] == 1 and field[0, 2, 0] == 2 and field[2, 0, 0] == 3 and field[2, 2, 0] == 4
+
+
+def test_smooth_field_with_no_smoothness_is_the_block_field():
+    vectors = np.int32([[[1, 0], [5, -2]], [[0, 3], [2, 2]]])
+    blocky = call(motion.to_field, vectors, (8, 8), 4)
+    smooth = call(motion.smooth_field, vectors, (8, 8), 4, 0.0)
+    assert np.array_equal(smooth, blocky)
+
+
+def test_smooth_field_has_no_jump_at_block_edges():
+    vectors = np.int32([[[0, 0], [8, 0]]])                       # one row of two blocks
+    smooth = call(motion.smooth_field, vectors, (16, 8), 8, 1.0)
+    steps = np.abs(np.diff(smooth[4, :, 0]))
+    assert steps.max() < 8                                       # the block field jumps by 8 at x = 8
+
+
+# --- warp ----------------------------------------------------------------------
+
+def test_warp_reads_from_x_plus_v_and_clamps_at_the_edge():
+    image = np.float32([[10, 20, 30, 40]])
+    field = np.zeros((1, 4, 2), np.float32)
+    field[..., 0] = 1
+    out = call(warp.warp, image, field)
+    assert out.dtype == np.float32
+    assert out.tolist() == [[20, 30, 40, 40]]
+
+
+def test_warp_bilinear_mixes_neighbours():
+    image = np.float32([[10, 20, 30, 40]])
+    field = np.zeros((1, 4, 2), np.float32)
+    field[..., 0] = 0.5
+    out = call(warp.warp, image, field, sampling="bilinear")
+    assert np.allclose(out, [[15, 25, 35, 40]])
+
+
+def test_warp_keeps_colour_channels_and_the_input():
+    image = np.arange(4 * 5 * 3, dtype=np.uint8).reshape(4, 5, 3)
+    image.flags.writeable = False
+    field = np.zeros((4, 5, 2), np.float32)
+    field[..., 1] = -1
+    out = call(warp.warp, image, field)
+    assert out.shape == (4, 5, 3)
+    assert np.array_equal(out[1:], image[:-1]) and np.array_equal(out[0], image[0])

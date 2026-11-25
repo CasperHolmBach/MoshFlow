@@ -1,0 +1,179 @@
+"""UI tests, run without a visible window."""
+
+import os
+import time
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import pytest
+
+pytest.importorskip("PySide6")
+
+from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QSpinBox
+
+from moshflow.api import BoolParam, ChoiceParam, FloatParam, IntParam
+from moshflow.ui.inspector import make_param_widget
+from moshflow.ui.main_window import MainWindow
+from moshflow.ui.model import CLIP, TRANSITION
+from test_render import make_video
+
+
+@pytest.fixture(scope="module")
+def app():
+    return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture
+def window(app, tmp_path):
+    win = MainWindow()
+    win.model.dirty = False
+    win.show()
+    paths = [make_video(tmp_path / f"{name}.mp4", value) for name, value in (("a", 40), ("b", 120), ("c", 200))]
+    assert win.model.import_media(paths) == []
+    win.paths = paths
+    yield win
+    win.model.dirty = False
+    win.close()
+
+
+def click(win, target):
+    for rect, kind, index in win.timeline.regions:
+        if (kind, index) == target:
+            pos = win.timeline.mapFromScene(rect.center())
+            QTest.mouseClick(win.timeline.viewport(), Qt.LeftButton, Qt.NoModifier, pos)
+            return
+    raise AssertionError(f"{target} is not on the timeline")
+
+
+def wait_for_export(app, bar, timeout=30.0):
+    deadline = time.monotonic() + timeout
+    while bar.worker is not None and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.005)
+    app.processEvents()
+    assert bar.worker is None, "export did not finish"
+
+
+def test_media_bin_lists_imported_videos(window):
+    assert window.media_bin.list.count() == 3
+    assert "a.mp4" in window.media_bin.list.item(0).text()
+
+
+def test_bad_file_is_reported_not_raised(window, tmp_path):
+    bad = tmp_path / "bad.mp4"
+    bad.write_text("not a video")
+    assert len(window.model.import_media([str(bad)])) == 1
+    assert window.media_bin.list.count() == 3
+
+
+def test_timeline_shows_clips_and_chips(window):
+    for path in window.paths:
+        window.model.add_clip(path)
+    kinds = [(kind, index) for _, kind, index in window.timeline.regions]
+    assert kinds.count((CLIP, 0)) == 1 and (CLIP, 2) in kinds
+    assert (TRANSITION, 0) in kinds and (TRANSITION, 1) in kinds
+
+
+def test_clicking_selects_and_fills_the_inspector(window):
+    window.model.add_clip(window.paths[0])
+    window.model.add_clip(window.paths[1])
+    click(window, (TRANSITION, 0))
+    assert window.model.selection == (TRANSITION, 0)
+    combos = window.inspector.findChildren(QComboBox)
+    assert combos and combos[0].findData("crossfade") >= 0
+    click(window, (CLIP, 1))
+    assert window.model.selection == (CLIP, 1)
+
+
+def test_changing_the_effect_shows_its_parameters(window):
+    window.model.add_clip(window.paths[0])
+    window.model.add_clip(window.paths[1])
+    click(window, (TRANSITION, 0))
+    effect_box = window.inspector.findChildren(QComboBox)[0]
+    effect_box.setCurrentIndex(effect_box.findData("crossfade"))
+    transition = window.model.project.transitions[0]
+    assert transition.effect == "crossfade"
+    labels = [w.value() for w in window.inspector.findChildren(QDoubleSpinBox)]
+    assert 1.0 in labels                                    # the default of "ease"
+    assert window.model.dirty
+
+
+def test_dragging_a_clip_reorders_it(window):
+    for path in window.paths:
+        window.model.add_clip(path)
+    timeline, viewport = window.timeline, window.timeline.viewport()
+    first = timeline._clip_rects[0]
+    last = timeline._clip_rects[2]
+    start = timeline.mapFromScene(first.center())
+    end = timeline.mapFromScene(QPointF(last.right() - 2, last.center().y()))
+    QTest.mousePress(viewport, Qt.LeftButton, Qt.NoModifier, start)
+    QTest.mouseMove(viewport, end)
+    QApplication.processEvents()
+    assert timeline._marker is not None
+    QTest.mouseRelease(viewport, Qt.LeftButton, Qt.NoModifier, end)
+    assert [os.path.basename(c.path) for c in window.model.project.clips] == ["b.mp4", "c.mp4", "a.mp4"]
+
+
+def test_delete_key_removes_the_selected_clip(window):
+    window.model.add_clip(window.paths[0])
+    window.model.add_clip(window.paths[1])
+    click(window, (CLIP, 0))
+    QTest.keyClick(window.timeline, Qt.Key_Delete)
+    assert [os.path.basename(c.path) for c in window.model.project.clips] == ["b.mp4"]
+    assert window.model.project.transitions == []
+
+
+def test_param_widget_factory():
+    results = []
+    assert isinstance(make_param_widget(IntParam("i", "I", 3, 1, 9), 3, results.append), QSpinBox)
+    assert isinstance(make_param_widget(BoolParam("b", "B", True), True, results.append), QCheckBox)
+    assert isinstance(make_param_widget(ChoiceParam("c", "C", "x", ("x", "y")), "x", results.append), QComboBox)
+    row = make_param_widget(FloatParam("f", "F", 0.5, 0.0, 1.0), 0.5, results.append)
+    row.findChild(QDoubleSpinBox).setValue(0.25)
+    assert results[-1] == 0.25
+
+
+def test_export_runs_in_the_background(app, window, tmp_path):
+    window.model.add_clip(window.paths[0])
+    window.model.add_clip(window.paths[1])
+    window.model.project.transitions[0].effect = "crossfade"
+    output = tmp_path / "out.mp4"
+    bar = window.export_bar
+    bar.run_worker(str(output))
+    assert not bar.export_button.isEnabled()
+    wait_for_export(app, bar)
+    assert output.exists()
+    assert bar.export_button.isEnabled() and bar.status.text().startswith("Done")
+    assert bar.progress.value() == bar.progress.maximum()
+
+
+def test_cancel_export_leaves_no_file(app, window, tmp_path):
+    window.model.add_clip(window.paths[0])
+    output = tmp_path / "cancelled.mp4"
+    bar = window.export_bar
+    bar.run_worker(str(output))
+    bar.cancel_export()
+    wait_for_export(app, bar)
+    assert not output.exists()
+
+
+def test_project_save_and_open(window, tmp_path):
+    window.model.add_clip(window.paths[0])
+    window.model.add_clip(window.paths[1])
+    window.model.project.transitions[0].duration = 2.5
+    path = str(tmp_path / "demo.moshproj")
+    window.model.save_project(path)
+    assert not window.model.dirty
+    window.model.new_project()
+    assert window.model.project.clips == [] and window.media_bin.list.count() == 0
+    assert window.model.open_project(path) == []
+    assert window.model.project.transitions[0].duration == 2.5
+    assert window.media_bin.list.count() == 2
+    assert len(window.timeline._clip_rects) == 2
+
+
+def test_relative_output_goes_next_to_the_first_clip(window):
+    window.model.add_clip(window.paths[0])
+    assert window.export_bar.resolved_output() == os.path.join(os.path.dirname(window.paths[0]), "output.mp4")

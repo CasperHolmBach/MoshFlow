@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Visual Studio
+.vs/
+*.pyproj.user
+*.suo
+
+# macOS
+.DS_Store
+
+# Renders made while testing (sample clips stay tracked)
+test.mp4
+output.mp4
