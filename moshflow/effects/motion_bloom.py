@@ -20,7 +20,7 @@ The transition, frame by frame:
   keeps moving inside the mosh and its motion mixes with B's in the same pixels.
 - B's P-frames, from B's first frame up to the end of B's window, are spread over
   the whole transition: output frame i is at a fractional position s among the
-  P-frames (see _b_position). Early on s moves at 0.15 P-frames per frame, so
+  P-frames (see _b_position). Early on s moves at 0.1 P-frames per frame, so
   each P-frame's motion is decoded for several frames in a row; repeating the
   motion makes it bloom, so moving areas keep stretching and swelling. Then B
   speeds up, and in the last part s moves one P-frame per frame, so the B that
@@ -31,8 +31,8 @@ The transition, frame by frame:
   Adding the full residual on every copy would burn the colours out.
 - Emerge: after every frame, each pixel also moves a step towards B's nearest
   real frame at that point: P += h (B - P). The steps follow a planned share of B
-  per pixel: it starts rising at 25 % of the transition where B changes most and
-  at 55 % where B is still, eases in and out, and reaches 1 on the last frame.
+  per pixel: it starts rising at 15 % of the transition where B changes most and
+  at 45 % where B is still, eases in and out, and reaches 1 on the last frame.
   So B grows out of the same motion that smears A, starting where B moves, and
   A's ghost lasts until the end instead of B finishing early and crawling.
   A pixel is dragged only by the share of A still left in it, so finished pixels
@@ -61,10 +61,10 @@ CONFIDENCE = 0.7     # keep a block's vector only if it cuts the block's error t
 LOOK_AHEAD = 30      # B frame pairs searched for the P-frame to repeat (no B window)
 RESIDUAL_COST = 0.3  # how much residual counts against motion when picking that P-frame
 CHANGE_FULL = 16.0   # residual (in grey levels) at which a pixel emerges earliest
-EARLY_START = 0.25   # share of the transition after which pixels where B changes turn into B
-LATE_START = 0.55    # ... and pixels where B is still
-SPEED_RAMP = 0.3     # share of the transition over which B speeds up to its real speed
-SLOW_SPEED = 0.15    # B's speed (P-frames per output frame) during the bloom at the start
+EARLY_START = 0.15   # share of the transition after which pixels where B changes turn into B
+LATE_START = 0.45    # ... and pixels where B is still
+SPEED_RAMP = 0.2     # share of the transition over which B speeds up to its real speed
+SLOW_SPEED = 0.1     # B's speed (P-frames per output frame) during the bloom at the start
 
 
 @register
