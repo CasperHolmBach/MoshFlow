@@ -2,21 +2,30 @@
 
 Emulates repeating one P-frame many times (Survey & Plan, 13.2). The motion
 between two neighbouring frames is measured once, as a field F. Starting from
-the last clean picture R of clip A, every output frame moves the picture along
-F again: R(k+1)(x, y) = R(k)(x + s dx, y + s dy). A pixel inside a moving area
-keeps being copied from the same direction, so the area stretches and swells,
-while pixels where F is (0, 0) stay frozen. Each frame the moving area also
-spreads downstream (see _spread), so the bloom keeps growing instead of stopping
-at the edge of the moving blocks.
+the last clean picture R of clip A, every output frame applies F once more.
+
+Instead of warping the picture again and again (which blurs it or, with
+nearest-pixel sampling, leaves zig-zag streaks), each pixel follows the flow:
+it keeps a displacement D, and every frame steps once more along F from where
+it already reads, D(k+1)(x) = D(k)(x) + s F(x + D(k)(x)). The output pixel is then
+read once from R: out(x) = R(x + D(k)(x)), with bilinear sampling. A pixel inside a
+moving area reads from further and further upstream, so the area stretches and
+swells; a pixel where F is (0, 0) stays frozen.
+
+Block matching is noisy in flat or blurry areas, and a wrong vector repeated
+many times turns into a random streak. So vectors that do not explain the
+motion clearly better than (0, 0) are dropped, and the block vectors are
+interpolated between block centres so no hard block edges appear.
 """
 
 import numpy as np
 
-from moshflow.api import ChoiceParam, EffectInfo, FloatParam, IntParam, TransitionEffect, register
+from moshflow.api import ChoiceParam, EffectInfo, FloatParam, TransitionEffect, register
 from moshflow.toolkit import color, frames, motion, warp
 
-BLOCK = 16    # block size and search range for capturing the motion
+BLOCK = 16          # block size and search range for capturing the motion
 SEARCH = 8
+CONFIDENCE = 0.7    # keep a block's vector only if it cuts the block's error to below 70 %
 FADE_PART = 1 / 3   # share of the transition that the "fade" release blends into clip B
 
 
@@ -28,26 +37,26 @@ class MotionBloom(TransitionEffect):
     @classmethod
     def param_specs(cls):
         return [
-            ChoiceParam("source", "Motion from", "B", ("A", "B")),
+            ChoiceParam("source", "Motion from", "A", ("A", "B")),
             FloatParam("gain", "Gain", 1.0, 0.0, 4.0),
             FloatParam("decay", "Decay", 0.02, 0.0, 0.5),
-            IntParam("spread", "Spread (px per frame)", 4, 0, 16),
             ChoiceParam("release", "Release", "fade", ("cut", "fade")),
         ]
 
     def render(self, ctx, progress):
         p = ctx.params
         field = _captured_field(ctx, p["source"])
-        picture = frames.last_clean_a(ctx).astype(np.float32)
+        start = frames.last_clean_a(ctx).astype(np.float32)
+        width, height = ctx.size
+        displacement = np.zeros((height, width, 2), np.float32)
         fade_length = max(1, round(ctx.length * FADE_PART)) if p["release"] == "fade" else 0
         for i, (clip, index) in enumerate(frames.window_frames(ctx)):
             if progress.cancelled:
                 return
-            # The same motion again, a little weaker every frame.
+            # One more step along the same motion, a little weaker every frame.
             strength = p["gain"] * (1.0 - p["decay"]) ** i
-            picture = warp.warp(picture, strength * field)
-            # The moving area grows in the direction it moves, so the bloom keeps pouring out.
-            field = _spread(field, p["spread"])
+            displacement = displacement + strength * warp.warp(field, displacement, "bilinear")
+            picture = warp.warp(start, displacement, "bilinear")
 
             out = picture
             if fade_length:
@@ -59,36 +68,6 @@ class MotionBloom(TransitionEffect):
 
             progress.report(i + 1, ctx.length)
             yield color.to_uint8(out)
-
-
-DIRECTIONS = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))
-
-
-def _spread(field: np.ndarray, step: int) -> np.ndarray:
-    """Lets the motion flow `step` pixels further downstream.
-
-    A pixel's vector v points to where its content comes from, so the content
-    flows the other way, along -v. For each of 8 directions u, pixel x looks at
-    the vector c of its neighbour x + step * u. If c points along u (the neighbour
-    pulls from further away, so its content flows towards x) and c is longer than
-    x's own vector, x takes c. Pixels upstream or beside a moving area keep theirs.
-    """
-    if step <= 0:
-        return field
-    height, width = field.shape[:2]
-    out = field.copy()
-    out_len2 = out[..., 0] ** 2 + out[..., 1] ** 2
-    for ux, uy in DIRECTIONS:
-        norm = (ux * ux + uy * uy) ** 0.5
-        ys = np.clip(np.arange(height) + round(step * uy / norm), 0, height - 1)
-        xs = np.clip(np.arange(width) + round(step * ux / norm), 0, width - 1)
-        c = field[ys[:, None], xs[None, :]]
-        c_len2 = c[..., 0] ** 2 + c[..., 1] ** 2
-        along = (c[..., 0] * ux + c[..., 1] * uy) / norm   # length of c along u
-        take = (along > 0.7 * c_len2 ** 0.5) & (c_len2 > out_len2)
-        out[take] = c[take]
-        out_len2[take] = c_len2[take]
-    return out
 
 
 def _clip_b_frame(ctx, clip, index: int) -> np.ndarray:
@@ -103,7 +82,7 @@ def _clip_b_frame(ctx, clip, index: int) -> np.ndarray:
 
 
 def _captured_field(ctx, source: str) -> np.ndarray:
-    """The motion between two neighbouring frames, as a per-pixel field (H, W, 2).
+    """The motion between two neighbouring frames, as a smooth per-pixel field (H, W, 2).
 
     "A": from the second-to-last to the last clean frame of A, so A's own motion
     carries on. "B": from B's first to its second frame, so B's motion drags A's picture.
@@ -118,6 +97,33 @@ def _captured_field(ctx, source: str) -> np.ndarray:
         clip = ctx.incoming
         first = ctx.b_window.start
         second = min(first + 1, len(clip) - 1)
-    vectors = motion.estimate(color.bgr_to_y(clip.frame(first)),
-                              color.bgr_to_y(clip.frame(second)), BLOCK, SEARCH)
-    return motion.to_field(vectors, ctx.size, BLOCK)
+    reference = color.bgr_to_y(clip.frame(first))
+    current = color.bgr_to_y(clip.frame(second))
+    vectors = motion.estimate(reference, current, BLOCK, SEARCH)
+    vectors = _confident(vectors, reference, current)
+    return motion.smooth_field(vectors, ctx.size, BLOCK, 1.0)
+
+
+def _confident(vectors: np.ndarray, reference: np.ndarray, current: np.ndarray) -> np.ndarray:
+    """Block vectors with the unreliable ones set to (0, 0).
+
+    For each block, error(v) = sum of |current(x) - reference(x + v)| over its pixels.
+    A vector is kept only if error(v) < CONFIDENCE * error(0): the match must be
+    clearly better than "nothing moved", otherwise it is just noise.
+    """
+    height, width = current.shape
+    field = motion.to_field(vectors, (width, height), BLOCK)
+    moved = _block_sums(np.abs(current - warp.warp(reference, field)), BLOCK)
+    still = _block_sums(np.abs(current - reference), BLOCK)
+    out = vectors.copy()
+    out[~(moved < CONFIDENCE * still)] = 0
+    return out
+
+
+def _block_sums(values: np.ndarray, block: int) -> np.ndarray:
+    """Sum of an H x W array over each block; partial blocks at the edges sum what they have."""
+    height, width = values.shape
+    rows, cols = -(-height // block), -(-width // block)
+    padded = np.zeros((rows * block, cols * block), np.float32)
+    padded[:height, :width] = values
+    return padded.reshape(rows, block, cols, block).sum(axis=(1, 3))
