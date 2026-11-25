@@ -1,12 +1,14 @@
-"""Liquid Melt: an optional sample skeleton.
+"""Liquid Melt: a lost I-frame with smooth motion in place of blocks (Survey & Plan, 13.3).
 
-A lost I-frame with smooth motion in place of blocks (Survey & Plan, 13.3):
-clip B's motion becomes a smooth flow, so clip A's picture streams like a
-liquid before it fades into clip B.
+The picture starts as the last clean frame of clip A. For every output frame, the
+block motion of the source video (A's tail, then B's head) is measured, turned into
+a smooth per-pixel flow and used to move the picture with bilinear sampling. So
+A's picture streams like a liquid along the real motion, without visible blocks,
+and over the last `fade` share of the window it blends into the real frames.
 
-SKELETON: render() is a plain cut until the TODO steps are written. Finish it,
-change it, or delete this file and write your own effect. When the
-effect works, remove "(draft)" from its name.
+One pixel: if the flow at (x, y) is (-1.5, 0.25), the new value there is a bilinear
+mix of the four old pixels around (x - 1.5, y + 0.25). Positions move by fractions
+of a pixel, so edges smear instead of jumping block by block.
 """
 
 import numpy as np
@@ -14,18 +16,17 @@ import numpy as np
 from moshflow.api import EffectInfo, FloatParam, IntParam, TransitionEffect, register
 from moshflow.toolkit import color, frames, motion, warp
 
-SEARCH = 8    # search range for the block matching; may become a parameter
-
 
 @register
 class LiquidMelt(TransitionEffect):
-    info = EffectInfo("liquid_melt", "Liquid Melt (draft)", "Sample",
-                      "Clip A's picture flows like a liquid along clip B's motion, then fades into B.")
+    info = EffectInfo("liquid_melt", "Liquid Melt", "Casper Bach",
+                      "Clip A's picture flows like a liquid along the video's motion, then fades into B.")
 
     @classmethod
     def param_specs(cls):
         return [
             IntParam("block", "Block size", 16, 8, 64),
+            IntParam("search", "Search range", 8, 2, 32),
             FloatParam("strength", "Strength", 1.0, 0.0, 3.0),
             FloatParam("smoothness", "Smoothness", 0.5, 0.0, 1.0),
             FloatParam("fade", "Fade", 0.3, 0.0, 1.0),
@@ -34,21 +35,40 @@ class LiquidMelt(TransitionEffect):
     def render(self, ctx, progress):
         p = ctx.params
         picture = frames.last_clean_a(ctx).astype(np.float32)
-        previous = picture
+        fade_frames = int(round(p["fade"] * ctx.length))
+        fade_start = ctx.length - fade_frames
+
         for i, (clip, index) in enumerate(frames.window_frames(ctx)):
             if progress.cancelled:
                 return
             current = clip.frame(index).astype(np.float32)
 
-            # TODO Step 1: block motion between the previous and the current source
-            # frame, turned into a smooth per-pixel flow:
-            #   vectors = motion.estimate(color.bgr_to_y(previous), color.bgr_to_y(current), p["block"], SEARCH)
-            #   flow = motion.smooth_field(vectors, ctx.size, p["block"], p["smoothness"])
-            # TODO Step 2: move the picture along the flow with bilinear sampling:
-            #   picture = warp.warp(picture, p["strength"] * flow, sampling="bilinear")
-            # TODO Step 3: over the last `fade` share of the window, blend towards clip B.
-            picture = current  # placeholder: a plain cut until the steps above exist
+            # Step 1 and 2: the clip's own motion into this frame, applied to our picture.
+            # The first frame of a clip has no motion (that is where the I-frame was).
+            if index > 0:
+                flow = _flow(clip.frame(index - 1), clip.frame(index), ctx.size, p)
+                picture = warp.warp(picture, p["strength"] * flow, sampling="bilinear")
 
-            previous = current
+            # Step 3: over the last fade_frames frames, blend towards the real frame,
+            # reaching it exactly on the last frame of the window.
+            out = picture
+            if i >= fade_start:
+                t = (i - fade_start + 1) / fade_frames
+                out = picture + t * (current - picture)
+
             progress.report(i + 1, ctx.length)
-            yield color.to_uint8(picture)
+            yield color.to_uint8(out)
+
+
+def _flow(previous, current, size, p) -> np.ndarray:
+    """Smooth H x W x 2 flow from previous to current, as in docs/API.md.
+
+    Block matching runs on every second pixel of the luma (a quarter of the work),
+    with half the block and search, and the vectors are doubled back to full size.
+    """
+    half_block = max(p["block"] // 2, 1)
+    half_search = max(p["search"] // 2, 1)
+    reference = color.bgr_to_y(previous)[::2, ::2]
+    target = color.bgr_to_y(current)[::2, ::2]
+    vectors = 2 * motion.estimate(reference, target, half_block, half_search)
+    return motion.smooth_field(vectors, size, 2 * half_block, p["smoothness"])
