@@ -26,11 +26,12 @@ The transition, frame by frame:
   next, and each P-frame's residual is spread over its copies (the step of s per
   frame), so it adds up to the residual once instead of landing in one frame.
   Adding the full residual on every copy would burn the colours out.
-- Emerge: after every frame, each pixel also moves a step towards B's real frame
-  at that point: P += h (B - P). h grows from 0 to 1 over the transition and is
-  larger where B's residual is large (where B changes), so B grows out of the
-  same motion that smears A, starting where B moves. On the last frame h = 1,
-  and the video carries on with B's next real frame.
+- Emerge: after every frame, each pixel also moves a step towards B's nearest
+  real frame at that point: P += h (B - P). The steps follow a planned share of B
+  per pixel: it starts rising at 20 % of the transition where B changes most and
+  at 70 % where B is still, eases in and out, and reaches 1 on the last frame.
+  So B grows out of the same motion that smears A, starting where B moves, and
+  A's ghost lasts until the end instead of B finishing early and crawling.
 - With no B window (alignment "before"), B has no P-frames before its first
   frame, so B's cleanest early P-frame is repeated instead.
 
@@ -51,7 +52,9 @@ SEARCH = 8
 CONFIDENCE = 0.7     # keep a block's vector only if it cuts the block's error to below 70 %
 LOOK_AHEAD = 30      # B frame pairs searched for the P-frame to repeat (no B window)
 RESIDUAL_COST = 0.3  # how much residual counts against motion when picking that P-frame
-CHANGE_FULL = 16.0   # residual (in grey levels) at which a pixel emerges fastest
+CHANGE_FULL = 16.0   # residual (in grey levels) at which a pixel emerges earliest
+EARLY_START = 0.2    # share of the transition after which pixels where B changes turn into B
+LATE_START = 0.7     # ... and pixels where B is still
 
 
 @register
@@ -92,6 +95,8 @@ class MotionBloom(TransitionEffect):
             target = b.frame(still).astype(np.float32)
 
         position = 0.0
+        changed = np.zeros(picture.shape[:2], np.float32)   # most B has changed at a pixel so far
+        shown = np.zeros(picture.shape[:2], np.float32)     # B's planned share at the last frame
         for i in range(ctx.length):
             if progress.cancelled:
                 return
@@ -107,12 +112,11 @@ class MotionBloom(TransitionEffect):
                 f = min(position - j, 1.0)
                 field_j, error, change = decoded(j)
                 field_next = decoded(j + 1)[0]
-                # Between two P-frames the motion and B's frame blend smoothly, so
-                # nothing jumps when the next P-frame takes over.
+                # Between two P-frames the motion blends smoothly, so nothing jumps
+                # when the next P-frame takes over. The pull goes to B's nearest real
+                # frame: blending two frames of a fast pan would show a double image.
                 field = (1.0 - f) * field_j + f * field_next
-                before, after = pairs[j]
-                target = ((1.0 - f) * b.frame(before).astype(np.float32)
-                          + f * b.frame(after).astype(np.float32))
+                target = b.frame(pairs[j][1] if f >= 0.5 else pairs[j][0]).astype(np.float32)
             else:
                 step = 1.0 / ctx.length
 
@@ -122,14 +126,35 @@ class MotionBloom(TransitionEffect):
             picture = warp.warp(picture, p["gain"] * field, "bilinear") + p["residual"] * step * error
             picture = np.clip(picture, 0.0, 255.0)
 
-            # Emerge: a step towards B's real frame, bigger later and where B changes.
-            h = np.minimum(p["emerge"] * u * u * (0.25 + 0.75 * change), 1.0)
+            # Emerge: B's share of each pixel follows a planned curve, so A's ghost
+            # lasts until the end of the transition whatever its length.
+            changed = np.maximum(changed, change)
+            share = _b_share(u, changed, p["emerge"])
             if i == ctx.length - 1:
-                h = np.ones_like(h)
+                h = np.ones_like(share)
+            else:
+                h = np.where(share >= 1.0, 1.0, 1.0 - (1.0 - share) / np.maximum(1.0 - shown, 1e-6))
+            h = np.clip(h, 0.0, 1.0)
             picture = picture + h[..., None] * (target - picture)
+            shown = share
 
             progress.report(i + 1, ctx.length)
             yield color.to_uint8(picture)
+
+
+def _b_share(u: float, changed: np.ndarray, emerge: float) -> np.ndarray:
+    """How much of B a pixel should show at progress u (0..1), per pixel.
+
+    A pixel starts turning into B at `start`: at EARLY_START of the transition where
+    B changes most, at LATE_START where B is still (earlier with a larger `emerge`).
+    From there its share follows a smoothstep, r^2 (3 - 2 r) with r = (u - start) /
+    (1 - start): it starts gently, and it also arrives gently, so the last frames
+    are already almost B and the transition lands without a jump.
+    """
+    amount = np.minimum(emerge * changed, 1.0)
+    start = LATE_START - (LATE_START - EARLY_START) * amount
+    ramp = np.clip((u - start) / (1.0 - start), 0.0, 1.0)
+    return ramp * ramp * (3.0 - 2.0 * ramp)
 
 
 def _b_pairs(ctx) -> list[tuple[int, int]]:
