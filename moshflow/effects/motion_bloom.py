@@ -39,7 +39,9 @@ The transition, frame by frame:
   are not cracked by B's rough vectors.
 - Exit: what is shown is the decoded picture mixed with B's real, sharp frame by
   share^2. The decoded picture is resampled every frame and slowly blurs; at the
-  end the viewer sees B's actual footage, so the exit is sharp.
+  end the viewer sees B's actual footage, so the exit is sharp. Where B's P-frame
+  failed (B moves faster than the motion search reaches), B's real frame is shown
+  sooner, like the intra blocks an encoder sends when prediction fails.
 - With no B window (alignment "before"), B has no P-frames before its first
   frame, so B's cleanest early P-frame is repeated instead.
 
@@ -167,10 +169,28 @@ class MotionBloom(TransitionEffect):
             # share^2. The decoded picture is resampled every frame and slowly blurs;
             # near the end this shows B's actual footage, so the exit is sharp and
             # moves at B's own speed.
-            sharp = (share * share)[..., None]
+            # Where B's current P-frame failed (B moves faster than the motion search
+            # reaches, so its residual is large and mostly noise), the decoded picture
+            # is speckled and lags behind B. There B's real frame is shown sooner, up to
+            # B's share: what an encoder does when prediction fails, sending fresh
+            # (intra) blocks. The failure is measured per 16 x 16 block and smoothed
+            # between block centres, so no block edges appear.
+            failed = _block_average(change, ctx.size)
+            sharp = np.maximum(share * share, share * failed)[..., None]
             out = picture + sharp * (target - picture)
             progress.report(i + 1, ctx.length)
             yield color.to_uint8(out)
+
+
+def _block_average(values: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """Average of an H x W map over each 16 x 16 block, interpolated smoothly between
+    block centres (the same bilinear interpolation as motion.smooth_field)."""
+    height, width = values.shape
+    rows, cols = -(-height // BLOCK), -(-width // BLOCK)
+    counts = _block_sums(np.ones_like(values, np.float32), BLOCK)
+    means = _block_sums(values.astype(np.float32), BLOCK) / counts
+    pair = np.stack([means, means], axis=-1)
+    return motion.smooth_field(pair, size, BLOCK, 1.0)[..., 0]
 
 
 def _b_position(u: float, count: int, length: int) -> float:
