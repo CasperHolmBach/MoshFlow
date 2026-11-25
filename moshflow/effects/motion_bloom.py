@@ -1,21 +1,24 @@
-"""Motion Bloom: one motion repeats, so moving pixels swell.
+"""Motion Bloom: one motion repeats, so moving pixels swell, and A blooms into B.
 
-Emulates repeating one P-frame many times (Survey & Plan, 13.2). The motion
-between two neighbouring frames is measured once, as a field F. Starting from
-the last clean picture R of clip A, every output frame applies F once more.
+Emulates repeating one P-frame many times (Survey & Plan, 13.2). For each clip,
+the motion between two neighbouring frames is measured once, as a field F
+(a vector per pixel). Repeating that P-frame n times moves every pixel n times
+along its vector, so pixel x reads from x + n F(x). Neighbouring pixels with
+different vectors drift apart a little more every frame, so moving areas
+stretch and swell, while pixels where F is (0, 0) stay frozen.
 
-Instead of warping the picture again and again (which blurs it or, with
-nearest-pixel sampling, leaves zig-zag streaks), each pixel follows the flow:
-it keeps a displacement D, and every frame steps once more along F from where
-it already reads, D(k+1)(x) = D(k)(x) + s F(x + D(k)(x)). The output pixel is then
-read once from R: out(x) = R(x + D(k)(x)), with bilinear sampling. A pixel inside a
-moving area reads from further and further upstream, so the area stretches and
-swells; a pixel where F is (0, 0) stays frozen.
+The whole transition is the bloom:
+- clip A blooms out: out_A(x) = A(x + n_A F_A(x)), with n_A growing from 1;
+- clip B blooms in, backwards: out_B(x) = B(x - n_B F_B(x)), with n_B shrinking
+  to 1 on the last frame, so B's swollen picture settles into its real frame;
+- in the middle, while both pictures are most swollen, each pixel switches from
+  out_A to out_B (a short blend with "fade", a hard switch with "cut").
 
 Block matching is noisy in flat or blurry areas, and a wrong vector repeated
 many times turns into a random streak. So vectors that do not explain the
 motion clearly better than (0, 0) are dropped, and the block vectors are
-interpolated between block centres so no hard block edges appear.
+interpolated between block centres so no hard block edges appear. Pixels are
+read with bilinear sampling, so there is no zig-zag from rounding.
 """
 
 import numpy as np
@@ -26,82 +29,91 @@ from moshflow.toolkit import color, frames, motion, warp
 BLOCK = 16          # block size and search range for capturing the motion
 SEARCH = 8
 CONFIDENCE = 0.7    # keep a block's vector only if it cuts the block's error to below 70 %
-FADE_PART = 1 / 3   # share of the transition that the "fade" release blends into clip B
+BLEND_PART = 0.5    # share of the transition, around the middle, that "fade" blends A into B
 
 
 @register
 class MotionBloom(TransitionEffect):
     info = EffectInfo("motion_bloom", "Motion Bloom (draft)", "Viktor Tost",
-                      "One motion repeats on the last picture of clip A, so moving areas swell.")
+                      "Clip A's motion repeats until A swells into clip B, which settles back into place.")
 
     @classmethod
     def param_specs(cls):
         return [
-            ChoiceParam("source", "Motion from", "A", ("A", "B")),
+            ChoiceParam("source", "Motion from", "own", ("own", "A", "B")),
             FloatParam("gain", "Gain", 1.0, 0.0, 4.0),
-            FloatParam("decay", "Decay", 0.02, 0.0, 0.5),
-            ChoiceParam("release", "Release", "fade", ("cut", "fade")),
+            FloatParam("decay", "Decay", 0.0, 0.0, 0.5),
+            ChoiceParam("release", "Switch to B", "fade", ("cut", "fade")),
         ]
 
     def render(self, ctx, progress):
         p = ctx.params
-        field = _captured_field(ctx, p["source"])
-        start = frames.last_clean_a(ctx).astype(np.float32)
-        width, height = ctx.size
-        displacement = np.zeros((height, width, 2), np.float32)
-        fade_length = max(1, round(ctx.length * FADE_PART)) if p["release"] == "fade" else 0
-        for i, (clip, index) in enumerate(frames.window_frames(ctx)):
+        picture_a = frames.last_clean_a(ctx).astype(np.float32)
+        b_index = _first_clean_b(ctx)
+        picture_b = ctx.incoming.frame(b_index).astype(np.float32)
+        field_a = _field(ctx.outgoing, max(ctx.a_window.start - 1, 0), -1, ctx.size)
+        field_b = _field(ctx.incoming, b_index, +1, ctx.size)
+        if p["source"] == "A":
+            field_b = field_a
+        elif p["source"] == "B":
+            field_a = field_b
+
+        steps = _repeats(ctx.length, p["gain"], p["decay"])
+        for i in range(ctx.length):
             if progress.cancelled:
                 return
-            # One more step along the same motion, a little weaker every frame.
-            strength = p["gain"] * (1.0 - p["decay"]) ** i
-            displacement = displacement + strength * warp.warp(field, displacement, "bilinear")
-            picture = warp.warp(start, displacement, "bilinear")
-
-            out = picture
-            if fade_length:
-                # Over the last frames, each pixel moves linearly from the bloom to B:
-                # out = (1 - w) * bloom + w * B, with w reaching 1 on the last frame.
-                w = min(max((i + 1 - (ctx.length - fade_length)) / fade_length, 0.0), 1.0)
-                if w > 0:
-                    out = (1.0 - w) * picture + w * _clip_b_frame(ctx, clip, index)
-
+            n_a, n_b = steps[i], steps[ctx.length - 1 - i]
+            w = _switch(i, ctx.length, p["release"])
+            out = 0.0
+            if w < 1:
+                out = (1.0 - w) * warp.warp(picture_a, n_a * field_a, "bilinear")
+            if w > 0:
+                out = out + w * warp.warp(picture_b, -n_b * field_b, "bilinear")
             progress.report(i + 1, ctx.length)
             yield color.to_uint8(out)
 
 
-def _clip_b_frame(ctx, clip, index: int) -> np.ndarray:
-    """The frame of B that output frame shows when there is no effect.
+def _repeats(length: int, gain: float, decay: float) -> list[float]:
+    """How many times the P-frame has been repeated at each output frame.
 
-    Inside B's window that is B's own frame; inside A's window it is B's first
-    frame, the one the video cuts to right after the transition.
+    Repeat k adds gain * (1 - decay) ** k, so with decay > 0 the motion slows down.
     """
-    if clip is ctx.incoming:
-        return clip.frame(index).astype(np.float32)
-    return ctx.incoming.frame(ctx.b_window.start).astype(np.float32)
+    total, out = 0.0, []
+    for k in range(length):
+        total += gain * (1.0 - decay) ** k
+        out.append(total)
+    return out
 
 
-def _captured_field(ctx, source: str) -> np.ndarray:
-    """The motion between two neighbouring frames, as a smooth per-pixel field (H, W, 2).
+def _switch(i: int, length: int, release: str) -> float:
+    """Weight of clip B in output frame i: 0 = only A, 1 = only B."""
+    t = (i + 0.5) / length
+    if release == "cut":
+        return 1.0 if t >= 0.5 else 0.0
+    u = min(max((t - 0.5) / BLEND_PART + 0.5, 0.0), 1.0)
+    return u * u * (3.0 - 2.0 * u)   # smoothstep: starts and ends gently
 
-    "A": from the second-to-last to the last clean frame of A, so A's own motion
-    carries on. "B": from B's first to its second frame, so B's motion drags A's picture.
+
+def _first_clean_b(ctx) -> int:
+    """B's frame just after the window: the real frame the bloom settles into."""
+    return min(ctx.b_window.stop, len(ctx.incoming) - 1)
+
+
+def _field(clip, index: int, toward: int, size: tuple[int, int]) -> np.ndarray:
+    """The motion at frame `index` of a clip, as a smooth per-pixel field (H, W, 2).
+
+    Measured between `index` and its neighbour (the frame before for toward=-1,
+    after for +1), always as earlier -> later, so F follows the clip's own motion.
     """
-    if source == "A":
-        clip = ctx.outgoing
-        second = max(ctx.a_window.start - 1, 0)
-        first = max(second - 1, 0)
-        if first == second:
-            second = min(1, len(clip) - 1)
-    else:
-        clip = ctx.incoming
-        first = ctx.b_window.start
-        second = min(first + 1, len(clip) - 1)
+    other = min(max(index + toward, 0), len(clip) - 1)
+    if other == index:
+        other = min(max(index - toward, 0), len(clip) - 1)
+    first, second = sorted((index, other))
     reference = color.bgr_to_y(clip.frame(first))
     current = color.bgr_to_y(clip.frame(second))
     vectors = motion.estimate(reference, current, BLOCK, SEARCH)
     vectors = _confident(vectors, reference, current)
-    return motion.smooth_field(vectors, ctx.size, BLOCK, 1.0)
+    return motion.smooth_field(vectors, size, BLOCK, 1.0)
 
 
 def _confident(vectors: np.ndarray, reference: np.ndarray, current: np.ndarray) -> np.ndarray:
