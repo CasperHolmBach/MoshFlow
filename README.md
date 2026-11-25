@@ -36,10 +36,9 @@ On Windows, use `.venv\Scripts\` instead of `.venv/bin/`.
 
 ## Work together
 
-Each member works on their own branch and opens a pull request into `main`;
-`main` always passes the tests.
+A suggested split, not a rule:
 
-| Branch | Who | Changes only |
+| Branch | Who | Main file |
 | --- | --- | --- |
 | `effect/keyframe-drop` | Nicolai Hansen | `moshflow/effects/keyframe_drop.py` |
 | `effect/motion-bloom` | Viktor Tost | `moshflow/effects/motion_bloom.py` |
@@ -47,7 +46,8 @@ Each member works on their own branch and opens a pull request into `main`;
 | `core/<topic>`, `ui/<topic>` | Yuhyeon Cha | Everything else |
 
 Effects depend only on `moshflow.api` and `moshflow.toolkit`, so work on the core and
-the UI does not affect them. See [`CLAUDE.md`](CLAUDE.md), "Git", for the full rules.
+the UI does not affect them. Run `python -m pytest` before merging into `main`.
+See [`CLAUDE.md`](CLAUDE.md), "Git", for more.
 
 ## Write an effect
 

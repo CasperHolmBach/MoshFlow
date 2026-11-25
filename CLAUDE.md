@@ -40,22 +40,22 @@ let the user ask Yuhyeon. A new shared helper goes in a new file in `moshflow/to
 
 ## Git
 
-The repository is `github.com/Fnhid/MoshFlow` (private). `main` must always pass
-`python -m pytest`, so everyone can start from it at any time.
+The repository is `github.com/Fnhid/MoshFlow`. These are suggestions, not rules;
+use whatever works for the person you are helping.
 
-- Never commit to `main` directly. Each person works on their own branch:
-  `effect/keyframe-drop` (Nicolai), `effect/motion-bloom` (Viktor),
-  `effect/liquid-melt` (Casper), and `core/<topic>` or `ui/<topic>` (Yuhyeon).
-- On an effect branch, change only that effect's file. Anything else needs Yuhyeon first.
-- Before opening a pull request, bring in the latest `main`
-  (`git fetch origin` then `git merge origin/main`) and run `python -m pytest`.
-- Open a pull request into `main`; Yuhyeon reviews and merges it.
-- Never commit `.venv/`, rendered videos, Word or PowerPoint files.
+- A branch per person keeps work apart, for example `effect/keyframe-drop`
+  (Nicolai), `effect/motion-bloom` (Viktor), `effect/liquid-melt` (Casper), and
+  `core/<topic>` or `ui/<topic>` (Yuhyeon).
+- Keeping an effect branch to that effect's file makes merging easy.
+- Before merging into `main`, bring in the latest `main`
+  (`git fetch origin` then `git merge origin/main`) and run `python -m pytest`,
+  so `main` keeps passing the tests.
+- A pull request lets the others see a change before it lands in `main`.
+- Do not commit `.venv/`, rendered videos, Word or PowerPoint files.
 
-Why this keeps work apart: effects import only `moshflow.api` and
-`moshflow.toolkit`, and the core and UI never import an effect directly. So
-changes to the core or UI cannot break an effect unless the API changes, and an
-API change gets its own pull request that the whole team sees first.
+Work stays apart even without these habits: effects import only `moshflow.api`
+and `moshflow.toolkit`, and the core and UI never import an effect directly. So
+changes to the core or UI do not break an effect unless the API changes.
 
 ## How an effect works
 
@@ -89,16 +89,16 @@ python3.12 -m venv .venv
 .venv/bin/python -m pytest tests/test_toolkit.py            # shared helpers
 .venv/bin/python -m moshflow.cli try --effect keyframe_drop a.mp4 b.mp4 -o test.mp4 --size 640x360
 .venv/bin/python run.py                                     # the GUI
-.venv/bin/python tools/update_vs_project.py                 # Yuhyeon only, after merging new .py files
+.venv/bin/python tools/update_vs_project.py                 # after adding or removing a .py file
 ```
 
 ## Definition of done
 
 1. `python -m pytest` passes, including `test_compliance.py` and `test_effect_contract.py`.
 2. `moshflow.cli try` renders a short video with the effect, and it looks right.
-3. The `.sln` and `.pyproj` are untouched. If you added a `.py` file, say so in the
-   pull request; Yuhyeon regenerates the Visual Studio files after merging, so two
-   branches never conflict in `MoshFlow.pyproj`.
+3. If you added or removed a `.py` file, run `tools/update_vs_project.py` so Visual
+   Studio lists it. If two branches both changed `MoshFlow.pyproj`, run it again
+   after merging instead of fixing the conflict by hand.
 4. No new dependencies, no edits outside your area, no debug files left behind.
 
 ## Visual Studio and submission
