@@ -37,14 +37,28 @@ On Windows, use `.venv\Scripts\` instead of `.venv/bin/`.
 **Edit > Undo** (Ctrl+Z) and **Redo** (Ctrl+Shift+Z) work for every change to the
 timeline, the Inspector and the export settings. One slider drag is one undo step.
 
+## Work together
+
+Suggested branches (optional):
+
+| Branch | Who | Main file |
+| --- | --- | --- |
+| `effect/<your-effect>` | Each effect author | `moshflow/effects/<your_effect>.py` |
+| `core/<topic>`, `ui/<topic>` | Yuhyeon Cha | Everything else |
+
+Effects depend only on `moshflow.api` and `moshflow.toolkit`, so work on the core and
+the UI does not affect them. Run `python -m pytest` before merging into `main`.
+See [`CLAUDE.md`](CLAUDE.md), "Git", for more.
+
 ## Write an effect
 
 The full contract is in [`docs/API.md`](docs/API.md). Team members using Claude Code
 should also read [`CLAUDE.md`](CLAUDE.md).
 
-Keyframe Drop, Motion Bloom and Liquid Melt are skeletons for now: they appear in the
-Inspector with their planned parameters, render a plain cut, and list the steps to
-write as `TODO` comments. The shared helpers they use, block matching in
+Each member writes the effect they want; it only has to follow the API. Keyframe Drop,
+Motion Bloom and Liquid Melt are optional starting points: they appear in the
+Inspector, render a plain cut, and list the steps of one possible design as `TODO`
+comments. Use one, change it, or delete it. The shared helpers, block matching in
 `toolkit/motion.py` and motion compensation in `toolkit/warp.py`, work and are
 checked by `tests/test_toolkit.py`.
 

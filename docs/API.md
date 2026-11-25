@@ -4,8 +4,8 @@ This is the contract between the core (Yuhyeon Cha) and the effects. It is froze
 as API v1: effects may rely on everything below, and the core will not change it
 without agreeing with the team first.
 
-The code is the source of truth: `moshflow/api/` and `moshflow/toolkit/`. This page
-explains it in one place.
+If this page and the code disagree, the code in `moshflow/api/` and
+`moshflow/toolkit/` is right.
 
 ## Where an effect sits
 
@@ -33,17 +33,16 @@ the video files, the encoder or the project file.
 | `moshflow/toolkit/frames.py` | `window_frames`, `last_clean_a` | Yuhyeon Cha |
 | `moshflow/toolkit/motion.py` | `estimate`, `to_field`, `smooth_field` | Yuhyeon Cha |
 | `moshflow/toolkit/warp.py` | `warp` | Yuhyeon Cha |
-| `moshflow/effects/keyframe_drop.py` | Keyframe Drop (skeleton) | Nicolai Hansen |
-| `moshflow/effects/motion_bloom.py` | Motion Bloom (skeleton) | Viktor Tost |
-| `moshflow/effects/liquid_melt.py` | Liquid Melt (skeleton) | Casper Bach |
 | `moshflow/effects/hard_cut.py`, `crossfade.py` | Working reference effects | Yuhyeon Cha |
+| `moshflow/effects/keyframe_drop.py`, `motion_bloom.py`, `liquid_melt.py` | Optional sample skeletons | Anyone |
+| `moshflow/effects/<your_effect>.py` | Your own effect | Its author |
 
 ## Frames
 
-A `Frame` is a NumPy array of shape `(H, W, 3)`, dtype `uint8`, in **BGR** order
+A `Frame` is a NumPy array of shape `(H, W, 3)`, dtype `uint8`, in BGR order
 (OpenCV's order). Every frame an effect reads and yields has the project size.
 
-Frames handed to an effect are **read-only**. Convert before doing maths:
+Frames handed to an effect are read-only. Convert before doing maths:
 
 ```python
 picture = clip.frame(i).astype(np.float32)   # a new, writable copy
@@ -91,8 +90,8 @@ The windows come from the transition's duration and alignment:
 | `center` | last n // 2 frames of A | first n - n // 2 frames of B |
 | `after` | empty | first n frames of B |
 
-An effect may read **any** frame of either clip, not only the windows. For example,
-a datamosh starts from the last clean frame of A before the window. Either window
+An effect may read any frame of either clip, including frames outside the windows.
+A datamosh, for example, starts from the last clean frame of A before the window. Either window
 can be empty, and a window can cover a whole clip.
 
 ## TransitionEffect
@@ -175,15 +174,15 @@ Helpers that more than one effect needs. They use plain NumPy arithmetic only.
 
 ### Motion vectors (motion.py and warp.py)
 
-These conventions are fixed. All three effects depend on them.
+Effects that use these helpers depend on these conventions, so they stay fixed.
 
-- A vector `v = (dx, dy)` says **where a pixel came from**:
+- A vector `v = (dx, dy)` says where a pixel came from:
   `current(x, y) ≈ reference(x + dx, y + dy)`. An object that moved 2 pixels to the
   right has `v = (-2, 0)`.
-- **Block vectors**: int32, shape `(rows, cols, 2)`, with
-  `rows = ceil(H / block)`, `cols = ceil(W / block)`. `[..., 0]` is dx, `[..., 1]` is dy.
+- Block vectors are int32 with shape `(rows, cols, 2)`, where
+  `rows = ceil(H / block)` and `cols = ceil(W / block)`. `[..., 0]` is dx, `[..., 1]` is dy.
   The last row and column of blocks may be smaller than `block × block`.
-- **Field**: float32, shape `(H, W, 2)`, one vector per pixel, same order.
+- A field is float32 with shape `(H, W, 2)`: one vector per pixel, in the same order.
 
 | Function | Does |
 | --- | --- |
@@ -203,11 +202,13 @@ Speed: on a 1280 × 720 frame, `estimate` with block 16 and search 8 takes about
 on every second pixel (`luma[::2, ::2]`, with half the block and search) and double
 the vectors.
 
-## The three effects (skeletons)
+## Sample skeletons (optional)
 
-Each file already registers its effect with the planned parameters, so it appears
-in the Inspector and passes the contract test. `render` is a plain cut for now; the
-`TODO` comments give the steps from the Survey & Plan, Section 13.
+Each member writes the effect they want; it only has to follow this API. The three
+files below are optional starting points: each registers an effect with example
+parameters, so it appears in the Inspector and passes the contract test. `render`
+is a plain cut, and the `TODO` comments give one possible design from the Survey &
+Plan, Section 13. Finish one, change it, or delete the file.
 
 | Effect | id | Parameters |
 | --- | --- | --- |
@@ -247,5 +248,5 @@ python -m moshflow.cli try --effect keyframe_drop a.mp4 b.mp4 -o test.mp4 --para
 ## Changing the API
 
 API v1 is frozen. If an effect needs something the API does not offer, ask Yuhyeon
-first. Most needs can be met inside the effect file or in a new toolkit helper,
-which does not change the API.
+first. An effect can usually do what it needs inside its own file or with a new
+toolkit helper, and neither changes the API.
