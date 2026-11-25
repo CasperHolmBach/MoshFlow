@@ -69,7 +69,7 @@ NO_B_PART = 1 / 3    # with no B window, the share of the end in which B emerges
 
 @register
 class MotionBloom(TransitionEffect):
-    info = EffectInfo("motion_bloom", "Motion Bloom (draft)", "Viktor Tost",
+    info = EffectInfo("motion_bloom", "Motion Bloom", "Viktor Tost",
                       "Clip B's P-frames play on clip A's last picture, one repeated, until B emerges.")
 
     @classmethod
