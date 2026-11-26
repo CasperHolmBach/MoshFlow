@@ -1,42 +1,53 @@
-"""DCT Crush: a decoder splices clip B's JPEG-style stream into clip A's
-(Survey & Plan, 6.4).
+"""DCT Crush: a dropped I-frame decoded block by block in a JPEG-style codec
+(Survey & Plan, 3.1 and 6.4).
 
-Both clips are coded the way JPEG and MPEG code a picture, by hand:
+Both clips are coded the way JPEG and MPEG code a picture, by hand: BGR to Y, Cb,
+Cr (BT.601), then every block x block square to frequency coefficients with the
+DCT, F = C . f . C^T. F[0, 0] (DC) is the block's average colour; the other
+coefficients (AC) are its texture and edges.
 
-1. Colour: BGR is converted to Y (brightness), Cb and Cr (colour), BT.601.
-2. DCT: the frame is cut into block x block squares and each square becomes
-   block x block frequency coefficients, F = C . f . C^T, where row u of C is a
-   cosine with u half-waves. F[0, 0] (DC) is the block's average; the other 63
-   (AC) are its texture and edges.
-3. Splice: the blocks form a stream, left to right and top to bottom, cut into
-   `tears` strips at fixed random points, like the resync points of a damaged
-   file. Every strip switches from A to B at its own moment, earlier near the top:
-   - shortly before: A's DC with B's AC, so B's edges appear in A's colours;
-   - at the switch: B's DC with A's AC, so A's edges linger in B's colours, and
-     B's blocks are read from up to `slide` blocks away in the stream, so the
-     strip tears sideways and then slides into place;
-   - after that: B's own blocks.
-4. Crush: every coefficient is rounded to a step from the standard JPEG table
-   times `crush` times a ramp that peaks in the middle of the window, so both clips
-   break into flat and gradient blocks with ringing edges. Colour gets `chroma`
-   times coarser steps.
-5. The inverse DCT, f = C^T . F . C, and the inverse colour conversion give the frame.
+The decoder keeps one grid of coefficient blocks, the picture it believes in. It
+starts as clip A's last frame before the mosh. For every frame of clip B:
 
-At the last frame every strip has switched and settled and nothing is rounded,
-so it is exactly B.
+1. Motion: block matching between B's previous and current frame gives every
+   block a vector and a residual (what the motion does not explain). The average
+   vector is the camera's motion; a block's own movement is its vector minus it.
+2. The coefficient grid is moved along B's vectors (bilinear between blocks), so
+   A's blocks travel the way B moves, camera pans included.
+3. Switch: every block adds up activity = residual / 32 + own movement / block
+   size. When the activity around it (its 5 x 5 block neighbourhood, so regions
+   switch together) reaches 1 / `sensitivity`, the block takes B's texture (AC)
+   at once; at 1 / `colour` it takes B's colour (DC) too and follows B from then
+   on. Blocks where B is still keep A's picture, as a decoder skips them.
+4. Crush: blocks with B's texture but A's colour are rounded to the JPEG table
+   times `crush`, so the damage sits where the switch happens. Colour gets
+   `chroma` times coarser steps.
+5. Refresh: over the last `heal` share the remaining blocks switch to B's block,
+   each all at once (never half blended), like an encoder's intra refresh. The
+   activity seeps outwards over the grid and the blocks are ranked by it, so B
+   spreads out from where it moved at an even pace, the same number of blocks
+   every frame. The last frame is exactly B.
 
-One pixel: in a strip that has just switched, its block has B's average colour but
-A's 63 texture coefficients, so the pixel is B's colour plus A's edge pattern at its
-position. With crush step 80, a coefficient of 130 becomes 160 and one of 30
-becomes 0, so fine detail is lost and edges ring.
+`timing` "at the cut" lets A's part of the window play clean and starts the mosh at
+B's first frame, with B at its real speed. "stretch" (and any window with no B part)
+moshes the whole window and plays B slower so it lands on the right frame.
+
+Block size and search range are given for 480p. Larger frames scale both (x2 at
+1080p), so a block covers the same part of the picture at every resolution.
+
+One pixel: the hand in B moves 6 pixels to the right of the camera's motion and
+leaves a residual of 32, so its 8 x 8 block gains 6 / 8 + 1 = 1.75 activity a
+frame. With sensitivity 0.5 the hand's region reaches 2 after about two frames and
+switches to B's texture in one step, while the still wall next to it keeps A's
+picture.
 """
 
 import math
 
 import numpy as np
 
-from moshflow.api import EffectInfo, FloatParam, IntParam, TransitionEffect, register
-from moshflow.toolkit import color
+from moshflow.api import ChoiceParam, EffectInfo, FloatParam, IntParam, TransitionEffect, register
+from moshflow.toolkit import color, motion, warp
 
 # Standard JPEG quantization tables (ITU-T T.81, Annex K) for brightness and colour.
 LUMA_TABLE = np.array([
@@ -50,106 +61,218 @@ CHROMA_TABLE = np.array([
     [99, 99, 99, 99, 99, 99, 99, 99], [99, 99, 99, 99, 99, 99, 99, 99],
     [99, 99, 99, 99, 99, 99, 99, 99], [99, 99, 99, 99, 99, 99, 99, 99]], np.float32)
 
-SWITCH = 0.28       # share of the window one strip takes from first B edges to settled
+CUT_LEVEL = 40.0    # mean luma difference above which two frames are a scene cut, not motion
+USEFUL_GAIN = 2.0   # luma levels per pixel a vector must save over standing still to count
+NOISE_FLOOR = 4.0   # mean residual per pixel that is only sensor noise
 
 
 @register
 class DctCrush(TransitionEffect):
     info = EffectInfo("dct_crush", "DCT Crush", "Casper Bach",
-                      "Clip B's JPEG stream is spliced into clip A's: strips tear, mix and slide into B.")
+                      "Clip B's moving parts refresh clip A's JPEG blocks; still parts keep A until B's next keyframe.")
 
     @classmethod
     def param_specs(cls):
         return [
+            ChoiceParam("timing", "B timing", "at the cut", ("at the cut", "stretch")),
             IntParam("block", "Block size", 8, 4, 32),
-            IntParam("tears", "Tears", 10, 1, 200),
-            IntParam("slide", "Slide", 24, 0, 128),
-            FloatParam("crush", "Crush", 3.0, 0.0, 30.0),
+            FloatParam("sensitivity", "Texture refresh", 0.5, 0.0, 3.0),
+            FloatParam("colour", "Colour refresh", 0.25, 0.0, 3.0),
+            FloatParam("crush", "Crush", 6.0, 0.0, 30.0),
             FloatParam("chroma", "Colour crush", 2.0, 1.0, 8.0),
-            FloatParam("order", "Top to bottom", 0.4, 0.0, 1.0),
+            FloatParam("heal", "Refresh", 0.3, 0.05, 0.6),
+            IntParam("search", "Search range", 8, 2, 32),
         ]
 
     def render(self, ctx, progress):
         p = ctx.params
-        n = p["block"]
+        width, height = ctx.size
+        # Block size and search are set for 480p; larger frames scale them up, so a
+        # block covers the same part of the picture at every resolution.
+        scale = max(1, int(round(min(width, height) / 480)))
+        n = max(2 * (p["block"] // 2), 4) * scale             # block size in pixels
+        stride = 2 * scale                                    # block matching on every stride-th pixel
         basis = _dct_matrix(n)
         steps = [_table(LUMA_TABLE, n), _table(CHROMA_TABLE, n) * p["chroma"], _table(CHROMA_TABLE, n) * p["chroma"]]
         is_dc = np.zeros((n, n), np.float32)
         is_dc[0, 0] = 1.0
-        a = ctx.outgoing
-        held_a = a.frame(ctx.a_window.stop - 1) if len(ctx.a_window) else a.frame(max(ctx.a_window.start - 1, 0))
-        first_b = ctx.incoming.frame(ctx.b_window.start if len(ctx.b_window) else 0)
-        width, height = ctx.size
-        rows, cols = -(-height // n), -(-width // n)
-        switch_at, offset = _strips(rows * cols, p, np.random.default_rng(ctx.seed))
+        a, b = ctx.outgoing, ctx.incoming
+        plan, mosh_frames = _plan(ctx, p["timing"])
+        start = _to_ycbcr(_first_a(ctx).astype(np.float32))
+        state = [_dct(plane, basis) for plane in start]       # the picture the decoder believes in
+        rows, cols = state[0].shape[:2]
+        busy = np.zeros((rows, cols), np.float32)             # all activity so far, per block
+        b_texture = np.zeros((rows, cols), np.float32)        # 1 = block shows B's AC
+        b_colour = np.zeros((rows, cols), np.float32)         # 1 = block shows B's DC too
+        jitter = np.random.default_rng(ctx.seed).random((rows, cols)).astype(np.float32)
+        turns = None                                          # when each block refreshes, 0..1
+        done, previous_j = 0, None
 
-        for i, (clip, index) in enumerate(_pairs(ctx)):
+        for i, (kind, j) in enumerate(plan):
             if progress.cancelled:
                 return
-            t = (i + 1) / ctx.length
-            frame_a = a.frame(index) if clip == "a" else held_a
-            frame_b = ctx.incoming.frame(index) if clip == "b" else first_b
+            if kind == "a":                                   # A plays clean until the cut
+                progress.report(i + 1, ctx.length)
+                yield a.frame(j)
+                continue
+            done += 1
+            t = done / mosh_frames
+            frame_b = b.frame(j)
+            coeff_b = [_dct(plane, basis) for plane in _to_ycbcr(frame_b.astype(np.float32))]
 
-            # Where every block is in its strip's switch: < 0 before, 0..1 during, > 1 after.
-            u = (t - switch_at) / SWITCH
-            b_ac = (u >= 0.0).astype(np.float32) * ((u < 0.4) | (u >= 0.7)).astype(np.float32)
-            b_ac = np.maximum(b_ac, ((u >= -0.6) & (u < 0.0)).astype(np.float32))
-            b_dc = (u >= 0.0).astype(np.float32)
-            # B's blocks are read from `offset` blocks away, shrinking to 0 as the strip settles.
-            shift = _round(offset * (1.0 - _smooth(u))).astype(np.int32)
-            source = np.clip(np.arange(rows * cols) - shift, 0, rows * cols - 1)
-            crush = p["crush"] * min(_smooth(t / 0.35), _smooth((1.0 - t) / 0.35))
+            if j > 0 and j != previous_j:
+                found = _block_motion(b.frame(j - 1), frame_b, n, p["search"], stride)
+                if found is not None:
+                    vectors, residual = found
+                    # Step 1: the block's own movement, without the camera's.
+                    camera = vectors.reshape(-1, 2).sum(axis=0) / (rows * cols)
+                    own = np.abs(vectors[..., 0] - camera[0]) + np.abs(vectors[..., 1] - camera[1])
+                    busy = busy + residual / 32.0 + own / n
+                    # Step 2: A's stale blocks travel with B's motion.
+                    for c in range(3):
+                        state[c] = _shift_blocks(state[c], vectors / n)
+            previous_j = j
 
-            planes_a = _to_ycbcr(frame_a.astype(np.float32))
-            planes_b = _to_ycbcr(frame_b.astype(np.float32))
+            # Step 3: a block switches, all at once, when the activity so far around it
+            # (its 5 x 5 neighbourhood, so whole regions switch together) is enough:
+            # texture at 1 / sensitivity, colour at 1 / colour (never before texture).
+            around = _blur3(_blur3(busy))
+            b_texture = np.maximum(b_texture, (around * p["sensitivity"] >= 1.0).astype(np.float32))
+            b_colour = np.maximum(b_colour, b_texture * (around * p["colour"] >= 1.0).astype(np.float32))
+
+            # Step 5: refresh, block by block. Over the last `heal` share every block
+            # switches to B's block at once (never half blended), spreading outwards
+            # from where B moved, the same number of blocks every frame.
+            s = (t - (1.0 - p["heal"])) / p["heal"]
+            if s >= 1.0:                                      # every block is B: B's own frame
+                progress.report(i + 1, ctx.length)
+                yield frame_b
+                continue
+            if s > 0.0:
+                if turns is None:
+                    turns = _refresh_turns(busy, jitter)
+                turn = (turns < s).astype(np.float32)
+                b_texture = np.maximum(b_texture, turn)
+                b_colour = np.maximum(b_colour, turn)
+
+            # Switched blocks follow B from now on; the others keep A's stale block.
+            take = b_colour[..., None, None] * is_dc + b_texture[..., None, None] * (1.0 - is_dc)
+            for c in range(3):
+                state[c] = state[c] + take * (coeff_b[c] - state[c])
+
+            # Step 4: crush the mixed blocks (B's texture in A's colour).
+            ramp = _smooth(t / 0.15)
+            crush = p["crush"] * ramp * (b_texture - b_colour)
             out = []
             for c in range(3):
-                flat_a = _dct(planes_a[c], basis).reshape(rows * cols, n, n)
-                flat_b = _dct(planes_b[c], basis).reshape(rows * cols, n, n)[source]
-                take_b = b_dc[:, None, None] * is_dc[None] + b_ac[:, None, None] * (1.0 - is_dc[None])
-                coeff = flat_a + take_b * (flat_b - flat_a)
-                if crush > 1e-3:
-                    step = steps[c] * crush
-                    coeff = _round(coeff / step) * step
-                out.append(_idct(coeff.reshape(rows, cols, n, n), basis, planes_a[c].shape))
+                step = steps[c] * np.maximum(crush, 1e-3)[..., None, None]
+                rounded = _round(state[c] / step) * step
+                use = (crush > 0.05).astype(np.float32)[..., None, None]
+                out.append(_idct(state[c] + use * (rounded - state[c]), basis, start[c].shape))
 
             progress.report(i + 1, ctx.length)
             yield color.to_uint8(_to_bgr(out))
 
 
-def _strips(total: int, p, rng) -> tuple[np.ndarray, np.ndarray]:
-    """Cut the stream of `total` blocks into p["tears"] strips at random points.
-    Returns, per block, when its strip switches to B (as a share of the window) and
-    how many blocks away B's blocks are read from at the switch."""
-    count = min(p["tears"], total)
-    cuts = np.zeros(total, np.int32)
-    if count > 1:
-        cuts[rng.permutation(total - 1)[:count - 1] + 1] = 1
-    strip = np.zeros(total, np.int32)
-    for k in range(1, total):                              # strip number of every block
-        strip[k] = strip[k - 1] + cuts[k]
-    first = np.zeros(count, np.float32)
-    for k in range(total - 1, -1, -1):                     # first block of every strip
-        first[strip[k]] = k
-    place = first / max(total - 1, 1)                      # 0 = top left, 1 = bottom right
-    when = p["order"] * place + (1.0 - p["order"]) * rng.random(count).astype(np.float32)
-    # The first B edges appear 0.6 * SWITCH early and the strip settles SWITCH later,
-    # so switches run from 0.6 * SWITCH + 0.05 to 0.97 - SWITCH.
-    low, high = 0.6 * SWITCH + 0.05, 0.97 - SWITCH
-    switch_at = (low + when * (high - low)).astype(np.float32)
-    offset = ((rng.random(count) * 2.0 - 1.0) * p["slide"]).astype(np.float32)
-    return switch_at[strip], offset[strip]
+def _plan(ctx, timing: str) -> tuple[list[tuple[str, int]], int]:
+    """("a", frame of A) or ("b", frame of B) for every output frame, and how many
+    frames are moshed.
+
+    "at the cut" with a B part: A's window plays clean, B's window is moshed at B's
+    real speed. Otherwise every frame is moshed and B runs from frame 0 to the last
+    frame of its window (slower if the window starts in A); with no B part it holds
+    B's first frame, because B starts at frame 0 after the cut."""
+    if timing == "at the cut" and len(ctx.b_window):
+        plan = [("a", k) for k in ctx.a_window] + [("b", k) for k in ctx.b_window]
+        return plan, len(ctx.b_window)
+    last = ctx.b_window.stop - 1 if len(ctx.b_window) else 0
+    if ctx.length == 1:
+        return [("b", last)], 1
+    return [("b", int(round(last * k / (ctx.length - 1)))) for k in range(ctx.length)], ctx.length
+
+
+def _first_a(ctx):
+    """The picture the mosh starts from: A's last frame inside the window, or the last
+    clean frame before it when A has no frames in the window."""
+    a = ctx.outgoing
+    if len(ctx.a_window):
+        return a.frame(ctx.a_window.stop - 1)
+    return a.frame(max(ctx.a_window.start - 1, 0))
+
+
+def _block_motion(previous, current, n: int, search: int, stride: int):
+    """B's block vectors (in pixels) and each block's mean residual after motion
+    compensation. Block matching runs on every stride-th pixel, with the block and
+    search shrunk by stride and the search set for 480p (search / 2 at that step);
+    the vectors are scaled back up. None across a scene cut."""
+    before, now = color.bgr_to_y(previous), color.bgr_to_y(current)
+    small_before, small_now = before[::stride, ::stride], now[::stride, ::stride]
+    if np.abs(small_now - small_before).sum() / small_now.size > CUT_LEVEL:
+        return None
+    vectors = stride * motion.estimate(small_before, small_now, n // stride, max(search // 2, 1))
+    height, width = now.shape
+    predicted = warp.warp(before, motion.to_field(vectors, (width, height), n))
+    moved_error = _blocks(np.abs(now - predicted), n).sum(axis=(2, 3)) / (n * n)
+    still_error = _blocks(np.abs(now - before), n).sum(axis=(2, 3)) / (n * n)
+    rows, cols = moved_error.shape
+    vectors = vectors[:rows, :cols].astype(np.float32)
+    # A vector only counts if it explains the block clearly better than standing
+    # still; on flat or noisy areas block matching picks random vectors.
+    useful = (still_error - moved_error >= USEFUL_GAIN).astype(np.float32)
+    vectors = vectors * useful[..., None]
+    error = moved_error * useful + still_error * (1.0 - useful)
+    residual = np.maximum(error - NOISE_FLOOR, 0.0)
+    return vectors, residual
+
+
+def _shift_blocks(grid: np.ndarray, moves: np.ndarray) -> np.ndarray:
+    """Backward warp of a rows x cols grid of coefficient blocks:
+    out(r, c) = grid(r + dy, c + dx), with (dx, dy) = moves[r, c] in blocks,
+    mixing the four nearest blocks' coefficients (bilinear)."""
+    rows, cols = grid.shape[:2]
+    ys = np.clip(np.arange(rows, dtype=np.float32)[:, None] + moves[..., 1], 0, rows - 1)
+    xs = np.clip(np.arange(cols, dtype=np.float32)[None, :] + moves[..., 0], 0, cols - 1)
+    y0, x0 = ys.astype(np.intp), xs.astype(np.intp)
+    y1, x1 = np.minimum(y0 + 1, rows - 1), np.minimum(x0 + 1, cols - 1)
+    wy, wx = (ys - y0)[..., None, None], (xs - x0)[..., None, None]
+    upper = grid[y0, x0] * (1 - wx) + grid[y0, x1] * wx
+    lower = grid[y1, x0] * (1 - wx) + grid[y1, x1] * wx
+    return (upper * (1 - wy) + lower * wy).astype(np.float32)
+
+
+def _refresh_turns(busy: np.ndarray, jitter: np.ndarray) -> np.ndarray:
+    """When every block switches in the final refresh, 0..1: the activity is let
+    seep outwards over the grid (12 rounds of 3 x 3 averaging), so every block
+    learns how close it is to where B moved; then the blocks are ranked, most
+    active first, and turn = rank / number of blocks, so the same number of
+    blocks switch every frame. A tiny random jitter breaks ties in calm areas."""
+    near = busy.astype(np.float32)
+    for _ in range(12):
+        near = _blur3(near)
+    near = near + 1e-4 * float(near.max() + 1.0) * jitter
+    values = near.ravel().tolist()
+    order = sorted(range(len(values)), key=lambda k: -values[k])
+    turns = np.zeros(len(values), np.float32)
+    for rank, k in enumerate(order):
+        turns[k] = rank / len(values)
+    return turns.reshape(busy.shape)
+
+
+def _blur3(values: np.ndarray) -> np.ndarray:
+    """Mean of each 3 x 3 neighbourhood of a rows x cols grid, edges repeated."""
+    rows, cols = values.shape
+    padded = values[np.clip(np.arange(-1, rows + 1), 0, rows - 1)][:, np.clip(np.arange(-1, cols + 1), 0, cols - 1)]
+    total = np.zeros_like(values, dtype=np.float32)
+    for dy in range(3):
+        for dx in range(3):
+            total += padded[dy:dy + rows, dx:dx + cols]
+    return total / 9.0
 
 
 def _smooth(x):
     """0 below 0, 1 above 1, and the smoothstep x * x * (3 - 2x) in between."""
     x = np.clip(x, 0.0, 1.0)
     return x * x * (3.0 - 2.0 * x)
-
-
-def _pairs(ctx):
-    """("a" or "b", frame index) for every output frame: A's window, then B's."""
-    return [("a", i) for i in ctx.a_window] + [("b", i) for i in ctx.b_window]
 
 
 def _dct_matrix(n: int) -> np.ndarray:
@@ -180,8 +303,12 @@ def _blocks(plane: np.ndarray, n: int) -> np.ndarray:
 
 
 def _times(left: np.ndarray, blocks: np.ndarray) -> np.ndarray:
-    """left . block for every block: out[.., u, y] = sum_x left[u, x] * block[.., x, y]."""
-    return (left[None, None, :, :, None] * blocks[:, :, None, :, :]).sum(axis=3)
+    """left . block for every block: out[.., u, y] = sum_x left[u, x] * block[.., x, y],
+    added up one x at a time so large frames need little memory."""
+    out = np.zeros(blocks.shape[:2] + (left.shape[0], blocks.shape[3]), np.float32)
+    for x in range(left.shape[1]):
+        out += left[None, None, :, x, None] * blocks[:, :, None, x, :]
+    return out
 
 
 def _dct(plane: np.ndarray, basis: np.ndarray) -> np.ndarray:
